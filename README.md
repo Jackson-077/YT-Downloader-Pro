@@ -122,6 +122,16 @@ python yt_downloader.py
 
 ---
 
+## Downloads
+
+Linux:
+Baixe o arquivo `.deb` na página de Releases.
+
+Windows:
+Baixe o arquivo `.exe` na página de Releases.
+
+---
+
 # Tecnologias utilizadas
 
 - Python
