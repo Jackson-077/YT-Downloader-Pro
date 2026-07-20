@@ -48,9 +48,15 @@ class Downloader:
             "Downloads"
         )
 
-        self.config_file = "config.json"
+        app_dir = os.path.join(
+            os.path.expanduser("~"),
+            ".yt-downloader"
+        )
 
-        self.history_file = "history.json"
+        os.makedirs(app_dir, exist_ok=True)
+
+        self.config_file = os.path.join(app_dir, "config.json")
+        self.history_file = os.path.join(app_dir, "history.json")
 
         self.load_config()
 
