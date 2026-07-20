@@ -60,6 +60,8 @@ e centenas de outros.
 
 A disponibilidade depende do suporte atual do **yt-dlp**.
 
+# Observações importantes
+- Alguns conteúdos podem exigir login no site de origem para permitir o download de vídeo ou áudio.
 ---
 
 # Download
