@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ==========================================================
 # YT Downloader Pro
-# Versão: 1.7 (Universal Edition - Linux/Windows)
+# Versão: 1.2 (Universal Edition - Linux/Windows)
 #
-# Autor: Jackson Q. 
-#
+# Autor: Jackson Q.
 # Downloader gráfico utilizando yt-dlp
 # Suporte: Local Binaries (FFmpeg, Deno) para Windows EXE
 # ==========================================================
@@ -24,6 +23,8 @@ from tkinter import filedialog, messagebox
 from PIL import Image
 from io import BytesIO
 from yt_dlp import YoutubeDL
+from urllib.parse import urlparse, parse_qs
+
 
 # -----------------------------
 # UTF-8 Windows
@@ -274,18 +275,18 @@ class Downloader:
         ]
 
 
-        opts["extractor_args"] = {
+        # opts["extractor_args"] = {
 
-            "youtube": {
+        #     "youtube": {
 
-                "player_client": [
-                    "web",
-                    "android"
-                ]
+        #         "player_client": [
+        #             "web",
+        #             "android"
+        #         ]
 
-            }
+        #     }
 
-        }
+        # }
 
 
         if sys.platform == "win32":
@@ -318,6 +319,9 @@ class Downloader:
         self.status_label.configure(text="Buscando informações...")
         threading.Thread(target=self.get_info, args=(url,), daemon=True).start()
 
+
+    from urllib.parse import urlparse, parse_qs
+
     def get_info(self, url):
         try:
             ydl_opts_fast = self.get_common_opts()
@@ -330,48 +334,109 @@ class Downloader:
             with YoutubeDL(ydl_opts_fast) as ydl:
                 info_raw = ydl.extract_info(url, download=False)
 
-            entries = info_raw.get("entries", [])
-            is_real_playlist = (info_raw.get("_type") == "playlist" or len(entries) > 1)
+            query = parse_qs(urlparse(url).query)
+
+            # A URL possui parâmetro list=
+            is_playlist_url = "list" in query
+
+            entries = info_raw.get("entries") or []
+
+            # Alguns tipos de playlist do YouTube retornam entries vazio.
+            # Nesse caso consultamos diretamente a playlist.
+            if is_playlist_url and not entries:
+                playlist_url = f"https://www.youtube.com/playlist?list={query['list'][0]}"
+
+                with YoutubeDL(ydl_opts_fast) as ydl:
+                    playlist_info = ydl.extract_info(playlist_url, download=False)
+
+                if playlist_info:
+                    info_raw = playlist_info
+                    entries = info_raw.get("entries") or []
+
+            # Quantidade total (limitada a 100)
+            total_videos = (
+                len(entries)
+                or info_raw.get("playlist_count")
+                or info_raw.get("n_entries")
+                or 0
+            )
+
+            total_videos = min(total_videos, 100)
+
+            # Salva para a interface
+            info_raw["video_count"] = total_videos
+
+            is_real_playlist = (
+                is_playlist_url
+                or info_raw.get("_type") == "playlist"
+                or total_videos > 1
+            )
 
             if is_real_playlist:
+
                 self.playlist_info = info_raw
                 self.playlist_url = url
-                
+
                 escolha = self.show_playlist_dialog()
-                
+
                 if escolha == "cancelar":
                     self.reset_ui_state()
                     return
-                
+
                 if escolha.startswith("playlist"):
+
                     self.tipo_download = "playlist"
+
                     if "mp3" in escolha:
-                        self.window.after(0, lambda: self.format_var.set("mp3"))
+                        self.window.after(
+                            0,
+                            lambda: self.format_var.set("mp3")
+                        )
                     else:
-                        self.window.after(0, lambda: self.format_var.set("mp4"))
-                    
+                        self.window.after(
+                            0,
+                            lambda: self.format_var.set("mp4")
+                        )
+
                     self.update_ui_playlist(info_raw)
                     return
-                
-                else: # Escolheu "video"
+
+                else:
+                    # Usuário escolheu baixar apenas o vídeo atual
                     self.tipo_download = "video"
-                    if entries:
-                        first_video = entries[0]
-                        self.video_url = first_video.get("url") or first_video.get("webpage_url") or url
-                    else:
-                        self.video_url = url
+                    self.video_url = url
+
             else:
+
                 self.tipo_download = "video"
                 self.video_url = url
 
             self.fetch_video_details(self.video_url)
 
         except Exception as e:
-            self.window.after(0, lambda: messagebox.showerror("Erro", f"Erro ao obter informações: {str(e)}"))
-            self.window.after(0, lambda: self.status_label.configure(text="Erro ao carregar."))
-        finally:
-            self.window.after(0, lambda: self.search_btn.configure(state="normal"))
+            self.window.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Erro",
+                    f"Erro ao obter informações:\n\n{e}"
+                )
+            )
 
+            self.window.after(
+                0,
+                lambda: self.status_label.configure(
+                    text="Erro ao carregar."
+                )
+            )
+
+        finally:
+            self.window.after(
+                0,
+                lambda: self.search_btn.configure(
+                    state="normal"
+                )
+            )
+    
     def fetch_video_details(self, url):
 
         try:
@@ -465,15 +530,35 @@ class Downloader:
 
     def update_ui_playlist(self, info):
         title = info.get("title", "Playlist")
-        entries = info.get("entries", [])
-        count = len(entries)
 
-        self.title_label.configure(text=f"Playlist: {title}")
-        self.channel_label.configure(text=f"Vídeos encontrados: {count} (Limite de 100)")
-        self.duration_label.configure(text="Pronto para baixar a playlist.")
-        self.status_label.configure(text="Playlist carregada.")
-        self.thumb_label.configure(image="", text="📚", font=("Arial", 50))
+        # Usa a quantidade calculada em get_info()
+        count = info.get(
+            "video_count",
+            len(info.get("entries", []))
+        )
 
+        self.title_label.configure(
+            text=f"Playlist: {title}"
+        )
+
+        self.channel_label.configure(
+            text=f"Vídeos encontrados: {count} (Máximo de 100 processados)"
+        )
+
+        self.duration_label.configure(
+            text="Pronto para baixar a playlist."
+        )
+
+        self.status_label.configure(
+            text="Playlist carregada."
+        )
+
+        self.thumb_label.configure(
+            image="",
+            text="📚",
+            font=("Arial", 50)
+        )
+    
     def load_thumbnail(self, url):
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
