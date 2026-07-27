@@ -18,12 +18,35 @@ import threading
 import subprocess
 import requests
 import re
+import io
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 from io import BytesIO
 from yt_dlp import YoutubeDL
 
+# -----------------------------
+# UTF-8 Windows
+# -----------------------------
+class UTF8Logger:
+
+    def debug(self, msg):
+        self.safe_print(msg)
+
+    def warning(self, msg):
+        self.safe_print(msg)
+
+    def error(self, msg):
+        self.safe_print(msg)
+
+    def safe_print(self, msg):
+        try:
+            print(str(msg).encode(
+                "utf-8",
+                "replace"
+            ).decode("utf-8"))
+        except:
+            pass
 # -----------------------------
 # Configuração de Caminhos para EXE
 # -----------------------------
@@ -36,73 +59,20 @@ def get_base_path():
 
 BASE_PATH = get_base_path()
 def add_browser_cookies(opts):
-    """
-    Detecta automaticamente navegadores instalados
-    e usa cookies do primeiro que funcionar.
-    Windows e Linux.
-    """
 
-    home = os.path.expanduser("~")
+    browsers = [
 
-    if sys.platform == "win32":
+        "edge",
+        "chrome",
+        "firefox",
+        "brave",
+        "opera",
+        "vivaldi"
 
-        browsers = [
-            ("chrome", os.path.join(
-                home, "AppData", "Local",
-                "Google", "Chrome", "User Data"
-            )),
-
-            ("edge", os.path.join(
-                home, "AppData", "Local",
-                "Microsoft", "Edge", "User Data"
-            )),
-
-            ("brave", os.path.join(
-                home, "AppData", "Local",
-                "BraveSoftware", "Brave-Browser", "User Data"
-            )),
-
-            ("firefox", os.path.join(
-                home, "AppData", "Roaming",
-                "Mozilla", "Firefox"
-            )),
-        ]
-
-    else:
-
-        browsers = [
-
-            ("firefox",
-             os.path.join(home, ".mozilla", "firefox")),
-
-            ("chrome",
-             os.path.join(home, ".config", "google-chrome")),
-
-            ("chromium",
-             os.path.join(home, ".config", "chromium")),
-
-            ("brave",
-             os.path.join(
-                 home,
-                 ".config",
-                 "BraveSoftware",
-                 "Brave-Browser"
-             )),
-
-            ("edge",
-             os.path.join(
-                 home,
-                 ".config",
-                 "microsoft-edge"
-             )),
-        ]
+    ]
 
 
-    for browser, path in browsers:
-
-        if not os.path.exists(path):
-            continue
-
+    for browser in browsers:
 
         try:
 
@@ -113,8 +83,7 @@ def add_browser_cookies(opts):
             )
 
 
-            # força o yt-dlp testar os cookies
-            with YoutubeDL(teste) as ydl:
+            with YoutubeDL(teste):
                 pass
 
 
@@ -124,7 +93,7 @@ def add_browser_cookies(opts):
 
 
             print(
-                f"[YT Downloader] Cookies usando: {browser}"
+                f"[YT Downloader] Cookie encontrado: {browser}"
             )
 
             return True
@@ -133,13 +102,10 @@ def add_browser_cookies(opts):
         except Exception as e:
 
             print(
-                f"[Cookies] Falhou {browser}: {e}"
+                f"Falhou {browser}: {e}"
             )
 
-            opts.pop(
-                "cookiesfrombrowser",
-                None
-            )
+            continue
 
 
     print(
@@ -288,16 +254,11 @@ class Downloader:
             "no_warnings": True,
             "socket_timeout": 60,
             "nocolor": True,
-
             "retries": 10,
             "fragment_retries": 10,
-
+            "logger": UTF8Logger(),
         }
 
-
-        # -----------------------------
-        # User Agent
-        # -----------------------------
 
         opts["http_headers"] = {
 
@@ -308,23 +269,10 @@ class Downloader:
         }
 
 
-        # -----------------------------
-        # JavaScript Challenge Solver
-        # -----------------------------
-
         opts["remote_components"] = [
             "ejs:github"
         ]
 
-
-        opts["js_runtimes"] = {
-            "deno": {}
-        }
-
-
-        # -----------------------------
-        # YouTube Clients
-        # -----------------------------
 
         opts["extractor_args"] = {
 
@@ -332,19 +280,13 @@ class Downloader:
 
                 "player_client": [
                     "web",
-                    "android",
-                    "tv"
+                    "android"
                 ]
 
             }
 
         }
 
-
-
-        # -----------------------------
-        # FFmpeg Windows
-        # -----------------------------
 
         if sys.platform == "win32":
 
@@ -358,15 +300,14 @@ class Downloader:
                 opts["ffmpeg_location"] = ffmpeg
 
 
-
-        # -----------------------------
-        # Cookies automáticos
-        # -----------------------------
-
-        add_browser_cookies(opts)
+        # NÃO coloca cookie aqui direto
+        # tenta primeiro sem cookie
 
 
         return opts
+
+
+
     def start_info_thread(self):
         url = self.url_entry.get().strip()
         if not url:
@@ -432,7 +373,9 @@ class Downloader:
             self.window.after(0, lambda: self.search_btn.configure(state="normal"))
 
     def fetch_video_details(self, url):
+
         try:
+
             ydl_opts = self.get_common_opts()
 
             ydl_opts.update({
@@ -440,43 +383,47 @@ class Downloader:
                 "noplaylist": True,
             })
 
+
             try:
+
                 # Primeira tentativa: sem cookies
-                ydl_opts.pop("cookiesfrombrowser", None)
+
+                ydl_opts.pop(
+                    "cookiesfrombrowser",
+                    None
+                )
 
                 with YoutubeDL(ydl_opts) as ydl:
+
                     self.info = ydl.extract_info(
                         url,
                         download=False
                     )
 
+
             except Exception as primeiro_erro:
 
+
                 print(
-                    "[YT Downloader] Falhou sem cookies. Tentando navegador..."
+                    "[YT Downloader] Falhou sem cookies. Testando navegadores..."
                 )
 
-                # Segunda tentativa: com cookies
-                browser = getattr(
-                    self,
-                    "cookie_browser",
-                    None
-                )
 
-                if browser:
+                # Segunda tentativa: cookies automáticos
 
-                    ydl_opts["cookiesfrombrowser"] = (
-                        browser,
-                    )
+                if add_browser_cookies(ydl_opts):
 
                     with YoutubeDL(ydl_opts) as ydl:
+
                         self.info = ydl.extract_info(
                             url,
                             download=False
                         )
 
                 else:
+
                     raise primeiro_erro
+
 
 
             self.window.after(
@@ -486,6 +433,7 @@ class Downloader:
 
 
         except Exception as e:
+
             raise e
 
     def update_ui_video(self, info):
@@ -566,7 +514,7 @@ class Downloader:
             title = self.playlist_info.get("title", "Sem título")
             count = len(self.playlist_info.get("entries", []))
 
-            ctk.CTkLabel(dialog, text="📚 Playlist detectada", font=("Arial", 22, "bold")).pack(pady=(20, 10))
+            ctk.CTkLabel(dialog, text=" Playlist detectada", font=("Arial", 22, "bold")).pack(pady=(20, 10))
             ctk.CTkLabel(dialog, text=f"Título: {title}", wraplength=400, font=("Arial", 14)).pack(pady=5)
             ctk.CTkLabel(dialog, text=f"Vídeos: {count} (Máximo 100 processados)", text_color="orange").pack(pady=5)
 
@@ -657,9 +605,7 @@ class Downloader:
                     "noplaylist": True,
                 })
 
-            print("=" * 60)
-            print(opts)
-            print("=" * 60)
+            
             with YoutubeDL(opts) as ydl:
                 ydl.download([url])
 
@@ -670,7 +616,7 @@ class Downloader:
                 self.save_history(self.info.get("title", "Vídeo"))
 
         except Exception as e:
-            erro = str(e)
+            erro = str(e).encode("utf-8", "replace").decode("utf-8")
 
             self.window.after(
                 0,
@@ -762,13 +708,13 @@ class Downloader:
     def load_config(self):
         if os.path.exists(self.config_file):
             try:
-                with open(self.config_file, "r") as f:
+                with open(self.config_file, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     self.download_folder = config.get("download_folder", self.download_folder)
             except: pass
 
     def save_config(self):
-        with open(self.config_file, "w") as f:
+        with open(self.config_file, "w", encoding="utf-8") as f:
             json.dump({"download_folder": self.download_folder}, f, indent=4)
 
     def save_history(self, titulo):
@@ -780,10 +726,10 @@ class Downloader:
         historico = []
         if os.path.exists(self.history_file):
             try:
-                with open(self.history_file, "r") as f: historico = json.load(f)
+                with open(self.history_file, "r", encoding="utf-8") as f: historico = json.load(f)
             except: pass
         historico.append(registro)
-        with open(self.history_file, "w") as f:
+        with open(self.history_file, "w", encoding="utf-8") as f:
             json.dump(historico, f, indent=4, ensure_ascii=False)
 
     def show_help(self):
