@@ -3,7 +3,7 @@
 # YT Downloader Pro
 # Versão: 1.7 (Universal Edition - Linux/Windows)
 #
-# Autor: Jackson Q. / Manus AI
+# Autor: Jackson Q. 
 #
 # Downloader gráfico utilizando yt-dlp
 # Suporte: Local Binaries (FFmpeg, Deno) para Windows EXE
