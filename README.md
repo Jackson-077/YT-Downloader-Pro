@@ -1,77 +1,146 @@
 # YT Downloader Pro
 
-Aplicativo gráfico desenvolvido em **Python**, utilizando **CustomTkinter** e **yt-dlp**, para baixar vídeos e áudios de centenas de sites suportados pelo yt-dlp.
+<p align="center">
+
+**Downloader gráfico para Windows e Linux utilizando Python + yt-dlp**
+
+Baixe vídeos, músicas, playlists e áudios de centenas de sites de forma simples, rápida e totalmente gratuita.
+
+</p>
 
 ---
 
-## Capturas de tela
+# Capturas de tela
 
 <p align="center">
   <img src="screenshots/1.png" width="48%">
   <img src="screenshots/2.png" width="48%">
-</p>Adicione imagens da interface na pasta `screenshots/` e atualize esta seção.)
+</p>
+
+> Adicione suas capturas de tela na pasta `screenshots/`.
 
 ---
 
 # Recursos
 
-- Interface moderna desenvolvida com CustomTkinter
-- Download de vídeos em MP4
-- Download de áudio em MP3
-- Busca automática das informações do vídeo
-- Exibição da miniatura (thumbnail)
-- Exibição do título
-- Exibição do canal
-- Exibição da duração
-- Escolha da qualidade do vídeo
-  - Melhor
-  - 1080p
-  - 720p
-  - 480p
-  - 360p
-- Barra de progresso em tempo real
-- Escolha da pasta de download
-- Configuração salva automaticamente
-- Histórico de downloads
-- Botão para limpar a URL
-- Botão para abrir a pasta de downloads
-- Janela de ajuda integrada
+O YT Downloader Pro foi desenvolvido para oferecer uma interface simples, moderna e intuitiva, permitindo baixar vídeos e áudios sem utilizar linha de comando.
+
+## Interface
+
+* Interface moderna desenvolvida com **CustomTkinter**
+* Compatível com Windows e Linux
+* Barra de progresso em tempo real
+* Atualização automática do status durante o download
+* Janela de ajuda integrada
+* Interface simples e intuitiva
+
+---
+
+## Download de vídeos
+
+* Download em MP4
+* Download em MP3
+* Escolha automática da melhor qualidade
+* Seleção manual da qualidade
+
+Qualidades disponíveis:
+
+* Melhor disponível
+* 1080p
+* 720p
+* 480p
+* 360p
+
+---
+
+## Informações do vídeo
+
+Antes do download o programa exibe automaticamente:
+
+* Miniatura (Thumbnail)
+* Título
+* Nome do canal
+* Duração
+* Informações da playlist (quando aplicável)
+
+---
+
+## Playlists
+
+Suporte para playlists do YouTube.
+
+É possível escolher entre:
+
+* Baixar toda a playlist em MP4
+* Baixar toda a playlist em MP3
+* Baixar apenas o vídeo selecionado
+
+Cada playlist é organizada automaticamente em sua própria pasta.
+
+---
+
+## Gerenciamento
+
+* Escolha da pasta de download
+* Configuração salva automaticamente
+* Histórico de downloads
+* Botão para abrir a pasta
+* Botão para limpar URL
+
+---
+
+## Compatibilidade automática
+
+O programa procura automaticamente cookies nos principais navegadores quando necessário.
+
+Navegadores suportados:
+
+* Microsoft Edge
+* Google Chrome
+* Mozilla Firefox
+* Brave
+* Opera
+* Vivaldi
+
+Isso aumenta a compatibilidade com vídeos que exigem autenticação.
 
 ---
 
 # Sites suportados
 
-O programa utiliza o **yt-dlp**, portanto suporta centenas de sites, incluindo:
+O programa utiliza o excelente projeto **yt-dlp**, suportando centenas de plataformas.
 
-- YouTube
-- TikTok
-- Facebook
-- Instagram
-- Dailymotion
-- X (Twitter)
-- Vimeo
-- Twitch
-- SoundCloud
-- Reddit
-- Pinterest
-- Bilibili
+Entre elas:
 
-e centenas de outros.
+* YouTube
+* TikTok
+* Facebook
+* Instagram
+* X (Twitter)
+* Vimeo
+* Twitch
+* Reddit
+* SoundCloud
+* Dailymotion
+* Bilibili
+* Pinterest
 
-A disponibilidade depende do suporte atual do **yt-dlp**.
+...e centenas de outros serviços.
 
-# Observações importantes
-- Alguns conteúdos podem exigir login no site de origem para permitir o download de vídeo ou áudio.
+> A disponibilidade depende do suporte atual do yt-dlp.
+
 ---
 
 # Download
 
-A versão mais recente pode ser baixada na página de **Releases** do projeto.
+A versão mais recente pode ser encontrada na página de **Releases**.
 
 Arquivos disponíveis:
 
-- Linux (.deb)
-- Windows (.exe)
+* Windows (.exe)
+* Linux (.deb)
+
+Não é necessário instalar Python para utilizar a versão Windows.
 
 ---
 
@@ -85,31 +154,34 @@ git clone https://github.com/jackson-077/yt-downloader-pro.git
 cd yt-downloader-pro
 ```
 
-Execute o instalador:
+Execute:
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-O instalador configura automaticamente:
+O instalador realiza automaticamente:
 
-- Python
-- pip
-- Ambiente virtual (venv)
-- FFmpeg
-- yt-dlp
-- Dependências Python
+* Atualização do sistema
+* Instalação do Python
+* Instalação do pip
+* Criação do ambiente virtual (venv)
+* Instalação do FFmpeg
+* Instalação do yt-dlp
+* Instalação das dependências Python
 
 ---
 
-# Executar
+# Executando
+
+Via script:
 
 ```bash
 ./run.sh
 ```
 
-ou
+Ou diretamente:
 
 ```bash
 python yt_downloader.py
@@ -117,53 +189,55 @@ python yt_downloader.py
 
 ---
 
-# Sistemas suportados
-
-- Linux (.deb)
-- Windows (.exe)
-
----
-
-## Downloads
-
-Linux:
-Baixe o arquivo `.deb` na página de Releases.
-
-Windows:
-Baixe o arquivo `.exe` na página de Releases.
-
----
-
 # Tecnologias utilizadas
 
-- Python
-- CustomTkinter
-- yt-dlp
-- FFmpeg
-- Pillow
-- Requests
+* Python
+* CustomTkinter
+* yt-dlp
+* FFmpeg
+* Requests
+* Pillow (PIL)
+* browser-cookie3
+* curl_cffi
 
 ---
 
 # Como usar
 
-1. Copie a URL do vídeo.
-2. Cole no campo de URL.
+1. Copie a URL do vídeo ou playlist.
+2. Cole na caixa de texto.
 3. Clique em **Buscar informações**.
-4. Escolha o formato:
-   - MP4
-   - MP3
-5. Escolha a qualidade desejada.
-6. Clique em **Baixar**.
+4. Aguarde o carregamento.
+5. Escolha:
+
+* MP4
+* MP3
+
+6. Escolha a qualidade desejada.
+7. Escolha a pasta de destino (opcional).
+8. Clique em **Baixar**.
+
+---
+
+# Recursos de segurança
+
+O programa:
+
+* Não envia dados para servidores externos.
+* Não exige login.
+* Utiliza apenas bibliotecas abertas.
+* Salva apenas configurações locais.
+* Não coleta informações pessoais.
 
 ---
 
 # Observações
 
-- Nem todos os sites oferecem todas as qualidades de vídeo.
-- Alguns vídeos podem exigir autenticação.
-- Alguns sites podem limitar downloads por região.
-- O suporte aos sites depende do projeto **yt-dlp**.
+* Algumas plataformas exigem autenticação.
+* Alguns vídeos privados não podem ser baixados.
+* Nem todos os sites disponibilizam todas as resoluções.
+* A velocidade depende da sua conexão e do servidor da plataforma.
+* Algumas plataformas podem alterar seu funcionamento ao longo do tempo.
 
 Caso algum site deixe de funcionar:
 
@@ -175,50 +249,95 @@ pip install -U yt-dlp
 
 # Problemas conhecidos
 
-## Vídeo com tela preta apenas no VLC
+## Tela preta apenas no VLC
 
 Se o vídeo abrir normalmente em outros reprodutores (MPV, Celluloid, Videos, Windows Media Player etc.), o arquivo está correto.
 
-Algumas versões do VLC apresentam incompatibilidade com determinados codecs quando a aceleração por hardware está ativada.
+Algumas versões do VLC apresentam problemas com aceleração por hardware.
 
 No VLC:
 
 ```
 Ferramentas
+
 → Preferências
+
 → Entrada / Codecs
+
 → Decodificação acelerada por hardware
 ```
 
-Altere para:
+Selecione:
 
-- Automático
+* Automático
 
 ou
 
-- Desativado
+* Desativado
 
 Depois reinicie o VLC.
 
 ---
 
-# Aviso
+# Estrutura do projeto
 
-Este programa utiliza o **yt-dlp** para acessar conteúdos públicos disponíveis na internet.
+```
+YT-Downloader-Pro/
 
-Respeite sempre os direitos autorais e os termos de uso das plataformas utilizadas.
+├── yt_downloader.py
+├── install.sh
+├── run.sh
+├── requirements.txt
+├── README.md
+├── screenshots/
+├── icone.ico
+├── LICENSE
+└── dist/
+```
+
+---
+
+# Contribuições
+
+Sugestões, melhorias e correções são sempre bem-vindas.
+
+Caso encontre algum problema, abra uma **Issue** ou envie um **Pull Request**.
+
+---
+
+# Agradecimentos
+
+Este projeto utiliza diversas bibliotecas da comunidade Open Source.
+
+Em especial:
+
+* yt-dlp
+* CustomTkinter
+* FFmpeg
+* Pillow
+
+Obrigado aos desenvolvedores desses projetos.
+
+---
+
+# Aviso Legal
+
+Este programa utiliza o **yt-dlp** para acessar conteúdos disponibilizados na internet.
+
+Utilize-o de acordo com a legislação do seu país, respeitando direitos autorais, licenças e os termos de uso de cada plataforma.
 
 ---
 
 # Licença
 
-Este projeto está licenciado sob a licença MIT.
+Este projeto está licenciado sob a licença **MIT**.
 
 Consulte o arquivo `LICENSE` para mais informações.
+
 ---
 
 # Autor
 
-**Jackson Q.**
+**Jackson Quequi**
 
-Desenvolvido com Python para facilitar o download de vídeos e áudios de diversas plataformas.
+Desenvolvido em Python com foco em simplicidade, praticidade e compatibilidade entre Windows e Linux.
