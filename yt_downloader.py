@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ==========================================================
 # YT Downloader Pro
-# Versão: 1.2 (Universal Edition - Linux/Windows)
+# Versão: 1.7 (Universal Edition - Linux/Windows)
 #
 # Autor: Jackson Q.
 # Downloader gráfico utilizando yt-dlp
@@ -18,11 +18,14 @@ import subprocess
 import requests
 import re
 import io
+import hashlib
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 from io import BytesIO
 from yt_dlp import YoutubeDL
+from yt_dlp.networking.impersonate import ImpersonateTarget
+from yt_dlp.postprocessor.common import PostProcessor
 from urllib.parse import urlparse, parse_qs
 
 
@@ -59,61 +62,394 @@ def get_base_path():
     return os.path.dirname(os.path.abspath(__file__))
 
 BASE_PATH = get_base_path()
-def add_browser_cookies(opts):
 
-    browsers = [
-
-        "edge",
-        "chrome",
-        "firefox",
-        "brave",
-        "opera",
-        "vivaldi"
-
-    ]
+LOCK_DIR = os.path.join(os.path.expanduser("~"), ".yt-downloader", "locks")
 
 
-    for browser in browsers:
-
+def _pid_ativo(pid):
+    """Verifica se um processo com esse PID ainda está rodando (Windows/Linux/Mac)."""
+    if sys.platform == "win32":
         try:
-
-            teste = opts.copy()
-
-            teste["cookiesfrombrowser"] = (
-                browser,
+            saida = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                text=True, stderr=subprocess.DEVNULL,
             )
+            return str(pid) in saida
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
 
 
-            with YoutubeDL(teste):
+def reservar_download(url, formato, qualidade, download_folder):
+    """Evita que duas instâncias do programa, baixando o MESMO vídeo ao
+    mesmo tempo, escrevam por cima do mesmo arquivo (o que corrompe o
+    resultado). Retorna (sufixo_arquivo, caminho_do_lock):
+      - sufixo_arquivo: "" normalmente, ou " (copia)" se outra instância
+        já estiver baixando exatamente este vídeo agora.
+      - caminho_do_lock: deve ser removido no finally do download.
+    """
+    try:
+        os.makedirs(LOCK_DIR, exist_ok=True)
+
+        chave = hashlib.md5(
+            f"{url}|{formato}|{qualidade}|{download_folder}".encode("utf-8")
+        ).hexdigest()
+        lock_path = os.path.join(LOCK_DIR, chave + ".lock")
+
+        outra_instancia_ativa = False
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r", encoding="utf-8") as f:
+                    pid_antigo = int(f.read().strip())
+                if pid_antigo != os.getpid() and _pid_ativo(pid_antigo):
+                    outra_instancia_ativa = True
+            except Exception:
                 pass
 
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
 
-            opts["cookiesfrombrowser"] = (
-                browser,
-            )
+        return (" (copia)" if outra_instancia_ativa else ""), lock_path
+
+    except Exception:
+        # Se o sistema de trava falhar por qualquer motivo, não deve
+        # impedir o download normal — só perdemos a proteção extra.
+        return "", None
 
 
-            print(
-                f"[YT Downloader] Cookie encontrado: {browser}"
-            )
+def liberar_download(lock_path):
+    if lock_path and os.path.exists(lock_path):
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
 
+
+def get_video_only_url(url):
+    """Remove parâmetros de playlist de links do YouTube para vídeo único."""
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+
+    if ("youtube.com" in parsed.netloc or "youtu.be" in parsed.netloc) and query.get("v"):
+        return f"https://www.youtube.com/watch?v={query['v'][0]}"
+
+    return url
+
+
+def add_browser_cookies(opts):
+    """Procura, em silêncio, um navegador com cookies de sessão utilizáveis.
+
+    Testa cada navegador suportado tentando de fato extrair cookies (não
+    apenas instanciar o YoutubeDL). Nenhuma mensagem de erro é exibida ao
+    usuário e nada é impresso no console caso nenhum navegador seja
+    encontrado — isso é esperado (nem todo mundo tem esses navegadores
+    instalados) e não deve parecer uma falha do programa.
+    """
+
+    browsers = [
+        "chrome",
+        "edge",
+        "brave",
+        "vivaldi",
+        "opera",
+        "firefox",
+    ]
+
+    for browser in browsers:
+        try:
+            teste = opts.copy()
+            teste["cookiesfrombrowser"] = (browser,)
+            teste["quiet"] = True
+            teste["no_warnings"] = True
+
+            with YoutubeDL(teste) as ydl:
+                # Força a extração real dos cookies (e não só a criação do
+                # objeto), que é onde erros de perfil/DB bloqueado aparecem.
+                ydl.cookiejar
+
+            opts["cookiesfrombrowser"] = (browser,)
             return True
 
-
-        except Exception as e:
-
-            print(
-                f"Falhou {browser}: {e}"
-            )
-
+        except Exception:
+            # Silencioso de propósito: navegador ausente, perfil bloqueado
+            # ou sem cookies são todos motivos legítimos de não usar esse
+            # navegador — não é um erro para mostrar ao usuário.
             continue
 
-
-    print(
-        "[YT Downloader] Nenhum navegador com cookies válido."
-    )
-
     return False
+
+
+def extrair_info_com_fallback(ydl_opts, url, **extract_kwargs):
+    """Chama ydl.extract_info tentando primeiro sem cookies e, se o site
+    pedir login/confirmação (ex.: "Sign in to confirm you're not a bot"
+    do YouTube), tenta de novo automaticamente com cookies de algum
+    navegador instalado — sem nunca expor esse processo como erro.
+
+    Usado tanto na busca rápida (extract_flat) quanto na busca detalhada,
+    para que o mesmo problema não precise ser corrigido em dois lugares.
+    """
+
+    opts = ydl_opts.copy()
+    opts.pop("cookiesfrombrowser", None)
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, **extract_kwargs)
+
+    except Exception as primeiro_erro:
+        msg = str(primeiro_erro).lower()
+
+        # Só vale a pena tentar cookies se o erro for de autenticação/
+        # bloqueio anti-bot. Para outros erros (URL inválida, vídeo
+        # removido, etc.) tentar cookies não resolveria nada.
+        precisa_login = any(
+            termo in msg
+            for termo in (
+                "sign in",
+                "confirm you", 
+                "not a bot",
+                "cookies",
+                "login required",
+                "private video",
+                "age",
+            )
+        )
+
+        if not precisa_login:
+            raise
+
+        cookies_ok = add_browser_cookies(opts)
+
+        if cookies_ok:
+            try:
+                with YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, **extract_kwargs)
+            except Exception:
+                pass  # tenta a próxima estratégia abaixo
+
+        # Cookies não resolveram (ou não havia navegador com cookies
+        # válidos). Alguns vídeos são bloqueados especificamente no
+        # cliente "mweb"/"tv"/"web_safari" que fixamos em get_common_opts;
+        # como último recurso, deixamos o yt-dlp escolher livremente entre
+        # TODOS os clientes que ele suporta (o comportamento padrão dele
+        # às vezes contorna esse bloqueio quando um cliente fixo não
+        # consegue).
+        if "extractor_args" in opts:
+            opts_sem_restricao = opts.copy()
+            opts_sem_restricao.pop("extractor_args", None)
+            try:
+                with YoutubeDL(opts_sem_restricao) as ydl:
+                    return ydl.extract_info(url, **extract_kwargs)
+            except Exception:
+                pass
+
+        # Nada funcionou: relata o erro original (mais claro para o
+        # usuário do que os erros das tentativas intermediárias).
+        raise primeiro_erro
+
+
+# -----------------------------
+# Garantia de Compatibilidade (H.264 + AAC)
+# -----------------------------
+class EnsureH264AACPP(PostProcessor):
+    """Garante que o arquivo .mp4 final seja H.264 (vídeo) + AAC (áudio).
+
+    O YouTube frequentemente só oferece os streams separados em VP9/AV1
+    (vídeo) e Opus (áudio). Quando isso acontece, o "merge_output_format":
+    "mp4" do yt-dlp apenas troca o CONTÊINER (remux) para .mp4, mas mantém
+    os codecs originais dentro dele — resultando em um arquivo .mp4 que
+    muitos players/TVs/celulares não conseguem reproduzir.
+
+    Este pós-processador roda depois do download/merge e:
+      1) Verifica os codecs reais do arquivo final via ffprobe.
+      2) Se já estiverem em H.264 + AAC, não faz nada (0 custo).
+      3) Caso contrário, recodifica apenas a trilha necessária (vídeo e/ou
+         áudio) com ffmpeg, mantendo a outra em "copy" sempre que possível
+         para economizar tempo e preservar qualidade.
+    """
+
+    # Cache no nível da classe: a detecção de hardware só precisa
+    # rodar uma vez por execução do programa, não a cada vídeo.
+    _encoder_cache = None
+
+    def __init__(self, downloader=None, ffmpeg_path="ffmpeg", ffprobe_path="ffprobe"):
+        super().__init__(downloader)
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+
+    def _detectar_encoder_video(self):
+        """Detecta o melhor codificador H.264 disponível: hardware primeiro
+        (muito mais rápido que CPU), com fallback para libx264 por software.
+
+        Retorna uma lista de argumentos ffmpeg (ex.: ["-c:v", "h264_nvenc", ...]).
+        """
+
+        if EnsureH264AACPP._encoder_cache is not None:
+            return EnsureH264AACPP._encoder_cache
+
+        # (encoder, args extras, nome amigável)
+        candidatos = [
+            ("h264_nvenc", ["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "20", "-b:v", "0"], "NVIDIA NVENC"),
+            ("h264_qsv", ["-preset", "faster", "-global_quality", "20"], "Intel Quick Sync"),
+            ("h264_videotoolbox", ["-q:v", "55"], "Apple VideoToolbox"),
+            ("h264_amf", ["-quality", "speed", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20"], "AMD AMF"),
+        ]
+
+        try:
+            encoders_disponiveis = subprocess.run(
+                [self.ffmpeg_path, "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout.lower()
+        except Exception:
+            encoders_disponiveis = ""
+
+        for nome_encoder, args_extra, label in candidatos:
+            if nome_encoder not in encoders_disponiveis:
+                continue
+
+            # Confirma que o encoder realmente funciona nesta máquina
+            # (listado no ffmpeg não significa necessariamente que há
+            # GPU/driver compatível disponível em tempo de execução).
+            teste = subprocess.run(
+                [
+                    self.ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+                    "-c:v", nome_encoder, "-frames:v", "1", "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+
+            if teste.returncode == 0:
+                resultado = ["-c:v", nome_encoder] + args_extra
+                EnsureH264AACPP._encoder_cache = (resultado, label)
+                return EnsureH264AACPP._encoder_cache
+
+        # Nenhuma GPU utilizável: usa libx264 por software, mas com preset
+        # rápido e todos os threads da CPU (em vez do "medium" original,
+        # que em vídeos longos de 1h+ demorava demais).
+        resultado = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-pix_fmt", "yuv420p",
+            "-threads", "0",
+        ]
+        EnsureH264AACPP._encoder_cache = (resultado, "CPU (libx264 veryfast)")
+        return EnsureH264AACPP._encoder_cache
+
+    def _probe_codec(self, filepath, stream_select):
+        cmd = [
+            self.ffprobe_path,
+            "-v", "error",
+            "-select_streams", stream_select,
+            "-show_entries", "stream=codec_name",
+            "-of", "csv=p=0",
+            filepath,
+        ]
+        resultado = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return resultado.stdout.strip().lower()
+
+    def run(self, info, _forcar_software=False):
+        filepath = info.get("filepath")
+
+        if not filepath or not os.path.exists(filepath):
+            return [], info
+
+        # Só nos interessa o resultado final em .mp4 (fluxo de vídeo).
+        if not filepath.lower().endswith(".mp4"):
+            return [], info
+
+        try:
+            vcodec = self._probe_codec(filepath, "v:0")
+            acodec = self._probe_codec(filepath, "a:0")
+        except Exception as e:
+            self.report_warning(
+                f"[H.264/AAC] Não foi possível verificar os codecs ({e}). "
+                "Mantendo o arquivo como está."
+            )
+            return [], info
+
+        precisa_video = bool(vcodec) and not vcodec.startswith(("h264", "avc1"))
+        precisa_audio = bool(acodec) and not acodec.startswith("aac")
+
+        if not precisa_video and not precisa_audio:
+            # Já está no padrão desejado (H.264 + AAC). Nada a fazer.
+            return [], info
+
+        self.to_screen(
+            f"[H.264/AAC] Ajustando compatibilidade "
+            f"(vídeo: {vcodec or '?'} -> "
+            f"{'h264' if precisa_video else 'mantido'}, "
+            f"áudio: {acodec or '?'} -> "
+            f"{'aac' if precisa_audio else 'mantido'})..."
+        )
+
+        tmp_path = filepath + ".h264aac.tmp.mp4"
+
+        cmd = [self.ffmpeg_path, "-y", "-i", filepath]
+
+        if precisa_video:
+            if _forcar_software:
+                args_encoder, label_encoder = [
+                    "-c:v", "libx264", "-preset", "veryfast",
+                    "-crf", "21", "-pix_fmt", "yuv420p", "-threads", "0",
+                ], "CPU (libx264 veryfast)"
+            else:
+                args_encoder, label_encoder = self._detectar_encoder_video()
+            self.to_screen(f"[H.264/AAC] Codificando com: {label_encoder}")
+            cmd += args_encoder
+        else:
+            cmd += ["-c:v", "copy"]
+
+        if precisa_audio:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd += ["-c:a", "copy"]
+
+        # +faststart move os metadados para o início do arquivo, permitindo
+        # início de reprodução mais rápido (importante em navegadores/TVs).
+        cmd += ["-movflags", "+faststart", tmp_path]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+            # Se o encoder de hardware falhou nesta execução real (driver
+            # desatualizado, VRAM insuficiente, etc.), força libx264 por
+            # software numa única nova tentativa antes de desistir do vídeo.
+            if precisa_video and not _forcar_software:
+                EnsureH264AACPP._encoder_cache = None
+                self.to_screen(
+                    "[H.264/AAC] Encoder de hardware falhou, tentando por software..."
+                )
+                return self.run(info, _forcar_software=True)
+
+            self.report_warning(
+                f"[H.264/AAC] Falha ao converter, mantendo arquivo original: {e.stderr}"
+            )
+            return [], info
+
+        os.replace(tmp_path, filepath)
+        info["filepath"] = filepath
+
+        return [], info
+
+
 # -----------------------------
 # Configuração da Interface
 # -----------------------------
@@ -257,16 +593,19 @@ class Downloader:
             "nocolor": True,
             "retries": 10,
             "fragment_retries": 10,
+            # Links de mídia do YouTube expiram rapidamente. Arquivos .part
+            # antigos não devem ser retomados, pois o servidor responde 403
+            # ao receber a requisição Range com a URL expirada.
+            "continuedl": False,
+            "nopart": True,
+            # O YouTube pode recusar a conexão IPv6 de alguns provedores,
+            # mesmo quando a página e os metadados são carregados normalmente.
+            "force_ipv4": True,
+            # Usa uma impressão digital real de navegador (curl_cffi), em vez
+            # de apenas alterar o texto do User-Agent. Isso reduz erros 403
+            # causados pela validação anti-bot do YouTube.
+            "impersonate": ImpersonateTarget.from_str("chrome-133:macos-15"),
             "logger": UTF8Logger(),
-        }
-
-
-        opts["http_headers"] = {
-
-            "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/138 Safari/537.36"
-
         }
 
 
@@ -274,19 +613,29 @@ class Downloader:
             "ejs:github"
         ]
 
-
-        # opts["extractor_args"] = {
-
-        #     "youtube": {
-
-        #         "player_client": [
-        #             "web",
-        #             "android"
-        #         ]
-
-        #     }
-
-        # }
+        # Provedor de PO Token. O YouTube passou a exigir esse token para
+        # liberar algumas URLs de áudio/vídeo; sem ele o servidor retorna 403.
+        # O caminho é relativo ao aplicativo para não depender de ~/. 
+        pot_server_home = os.path.join(
+            BASE_PATH,
+            ".tools",
+            "bgutil-ytdlp-pot-provider",
+            "server",
+        )
+        # A implementação Deno do provedor é TypeScript.
+        if os.path.isfile(os.path.join(pot_server_home, "src", "generate_once.ts")):
+            opts["extractor_args"] = {
+                "youtube": {
+                    # "mweb" primeiro (usa o PO Token do provedor local),
+                    # mas com "tv" e "web_safari" como alternativas — esses
+                    # dois raramente são bloqueados pelo "confirm you're
+                    # not a bot" mesmo sem PO Token/cookies.
+                    "player_client": ["mweb", "tv", "web_safari"],
+                },
+                "youtubepot-bgutilscript": {
+                    "server_home": [pot_server_home],
+                },
+            }
 
 
         if sys.platform == "win32":
@@ -319,20 +668,22 @@ class Downloader:
         self.status_label.configure(text="Buscando informações...")
         threading.Thread(target=self.get_info, args=(url,), daemon=True).start()
 
-
-    from urllib.parse import urlparse, parse_qs
-
     def get_info(self, url):
         try:
             ydl_opts_fast = self.get_common_opts()
             ydl_opts_fast.update({
                 "skip_download": True,
                 "extract_flat": True,
-                "playlistend": 100,
+                # Para identificar uma playlist basta ler o primeiro item.
+                # Consultar os 100 itens de um Mix antes de o usuário decidir
+                # baixar apenas o vídeo dispara muitas chamadas ao YouTube e
+                # pode provocar bloqueio HTTP 403 na mídia logo em seguida.
+                "playlistend": 1,
             })
 
-            with YoutubeDL(ydl_opts_fast) as ydl:
-                info_raw = ydl.extract_info(url, download=False)
+            info_raw = extrair_info_com_fallback(
+                ydl_opts_fast, url, download=False
+            )
 
             query = parse_qs(urlparse(url).query)
 
@@ -346,18 +697,20 @@ class Downloader:
             if is_playlist_url and not entries:
                 playlist_url = f"https://www.youtube.com/playlist?list={query['list'][0]}"
 
-                with YoutubeDL(ydl_opts_fast) as ydl:
-                    playlist_info = ydl.extract_info(playlist_url, download=False)
+                playlist_info = extrair_info_com_fallback(
+                    ydl_opts_fast, playlist_url, download=False
+                )
 
                 if playlist_info:
                     info_raw = playlist_info
                     entries = info_raw.get("entries") or []
 
-            # Quantidade total (limitada a 100)
+            # Quantidade total (limitada a 100). Dá prioridade ao total que
+            # o YouTube informa, pois acima só carregamos o primeiro item.
             total_videos = (
-                len(entries)
-                or info_raw.get("playlist_count")
+                info_raw.get("playlist_count")
                 or info_raw.get("n_entries")
+                or len(entries)
                 or 0
             )
 
@@ -404,12 +757,12 @@ class Downloader:
                 else:
                     # Usuário escolheu baixar apenas o vídeo atual
                     self.tipo_download = "video"
-                    self.video_url = url
+                    self.video_url = get_video_only_url(url)
 
             else:
 
                 self.tipo_download = "video"
-                self.video_url = url
+                self.video_url = get_video_only_url(url)
 
             self.fetch_video_details(self.video_url)
 
@@ -448,48 +801,9 @@ class Downloader:
                 "noplaylist": True,
             })
 
-
-            try:
-
-                # Primeira tentativa: sem cookies
-
-                ydl_opts.pop(
-                    "cookiesfrombrowser",
-                    None
-                )
-
-                with YoutubeDL(ydl_opts) as ydl:
-
-                    self.info = ydl.extract_info(
-                        url,
-                        download=False
-                    )
-
-
-            except Exception as primeiro_erro:
-
-
-                print(
-                    "[YT Downloader] Falhou sem cookies. Testando navegadores..."
-                )
-
-
-                # Segunda tentativa: cookies automáticos
-
-                if add_browser_cookies(ydl_opts):
-
-                    with YoutubeDL(ydl_opts) as ydl:
-
-                        self.info = ydl.extract_info(
-                            url,
-                            download=False
-                        )
-
-                else:
-
-                    raise primeiro_erro
-
-
+            self.info = extrair_info_com_fallback(
+                ydl_opts, url, download=False
+            )
 
             self.window.after(
                 0,
@@ -632,12 +946,80 @@ class Downloader:
         
         threading.Thread(target=self.run_download, daemon=True).start()
 
+    def _baixar_youtube_dl(self, opts, url, formato):
+        """Baixa com yt-dlp tentando primeiro SEM cookies (mais rápido e
+        não mexe nos navegadores). Só busca cookies de sessão se o próprio
+        site pedir login/confirmação de que não é um robô — e, mesmo
+        assim, em silêncio, sem mostrar isso como erro."""
+
+        def _run(o):
+            with YoutubeDL(o) as ydl:
+                if formato == "mp4":
+                    ydl.add_post_processor(
+                        EnsureH264AACPP(
+                            downloader=ydl,
+                            ffmpeg_path=self.get_ffmpeg_binary(),
+                            ffprobe_path=self.get_ffprobe_binary(),
+                        ),
+                        when="after_move",
+                    )
+                ydl.download([url])
+
+        opts_sem_cookie = opts.copy()
+        opts_sem_cookie.pop("cookiesfrombrowser", None)
+
+        try:
+            _run(opts_sem_cookie)
+            return
+        except Exception as primeiro_erro:
+            msg = str(primeiro_erro).lower()
+            precisa_login = any(
+                termo in msg for termo in (
+                    "sign in", "confirm you", "not a bot", "cookies",
+                    "login required", "private video", "age",
+                )
+            )
+            if not precisa_login:
+                raise
+
+            opts_cookie = opts.copy()
+            if not add_browser_cookies(opts_cookie):
+                raise primeiro_erro
+
+            try:
+                _run(opts_cookie)
+                return
+            except Exception:
+                # Última tentativa: deixa o yt-dlp escolher livremente
+                # entre todos os clientes, sem restringir a mweb/tv.
+                if "extractor_args" in opts_cookie:
+                    opts_livre = opts_cookie.copy()
+                    opts_livre.pop("extractor_args", None)
+                    _run(opts_livre)
+                    return
+                raise
+
     def run_download(self):
+        lock_path = None
         try:
             formato = self.format_var.get()
             qualidade = self.quality_combo.get()
             url = self.playlist_url if self.tipo_download == "playlist" else self.video_url
-            
+           
+            # Protege contra a mesma URL sendo baixada ao mesmo tempo por
+            # duas instâncias do programa (o que corromperia o arquivo).
+            sufixo_duplicata, lock_path = reservar_download(
+                url, formato, qualidade, self.download_folder
+            )
+
+            if sufixo_duplicata:
+                self.window.after(
+                    0,
+                    lambda: self.status_label.configure(
+                        text="Este vídeo já está sendo baixado em outra janela. Salvando como cópia..."
+                    )
+                )
+
             opts = self.get_common_opts()
             opts.update({
                 "progress_hooks": [self.update_progress_hook],
@@ -663,14 +1045,22 @@ class Downloader:
 
                 res = res_map.get(qualidade)
 
+                # Prioriza vídeo H.264 (avc1) + áudio AAC (mp4a) nativos do
+                # YouTube sempre que existirem para essa resolução — assim
+                # evitamos recodificação desnecessária. Se não existirem
+                # (comum em 1440p/4K, que costuma vir apenas em VP9/AV1),
+                # caímos para o melhor disponível; o EnsureH264AACPP cuida
+                # de recodificar apenas quando for realmente preciso.
                 if res:
                     opts["format"] = (
-                        f"bestvideo*[height<={res}]+bestaudio/"
+                        f"bestvideo[vcodec^=avc1][height<={res}]+bestaudio[acodec^=mp4a]/"
+                        f"bestvideo[height<={res}]+bestaudio/"
                         f"best[height<={res}]/"
                         f"best"
                     )
                 else:
                     opts["format"] = (
+                        "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
                         "bestvideo*+bestaudio/"
                         "best"
                     )
@@ -680,19 +1070,66 @@ class Downloader:
             # Caminho de Saída
             if self.tipo_download == "playlist":
                 opts.update({
-                    "outtmpl": os.path.join(self.download_folder, "%(playlist_title)s", "%(playlist_index)s - %(title)s.%(ext)s"),
+                    "outtmpl": os.path.join(
+                        self.download_folder, "%(playlist_title)s",
+                        f"%(playlist_index)s - %(title)s{sufixo_duplicata}.%(ext)s",
+                    ),
                     "noplaylist": False,
                     "playlistend": 100,
+                    # Evita que o YouTube bloqueie a sequência de 100
+                    # downloads como tráfego automatizado. A pequena pausa é
+                    # aplicada somente em playlists, não em vídeo único.
+                    "sleep_interval_requests": 1,
+                    "sleep_interval": 2,
+                    "max_sleep_interval": 4,
+                    # Se o YouTube recusar temporariamente um item, segue
+                    # com os próximos da playlist em vez de abortar tudo.
+                    "ignoreerrors":  False,
                 })
             else:
                 opts.update({
-                    "outtmpl": os.path.join(self.download_folder, "%(title).100s [%(id)s].%(ext)s"),
+                    "outtmpl": os.path.join(
+                        self.download_folder,
+                        f"%(title).100s [%(id)s]{sufixo_duplicata}.%(ext)s",
+                    ),
                     "noplaylist": True,
                 })
 
             
-            with YoutubeDL(opts) as ydl:
-                ydl.download([url])
+            try:
+                self._baixar_youtube_dl(opts, url, formato)
+            except Exception as erro_download:
+                # Alguns fluxos separados do YouTube (vídeo + áudio) exigem
+                # um PO Token e podem devolver 403. Para vídeo individual,
+                # tentamos então um MP4 progressivo, que já contém áudio e
+                # vídeo no mesmo arquivo; assim nunca concluímos com vídeo
+                # mudo por causa da falha do fluxo de áudio.
+                is_youtube = "youtube.com" in url or "youtu.be" in url
+                if (self.tipo_download != "video" or formato != "mp4"
+                        or not is_youtube):
+                    raise erro_download
+
+                self.window.after(
+                    0,
+                    lambda: self.status_label.configure(
+                        text="YouTube recusou alta qualidade. Tentando MP4 com áudio..."
+                    )
+                )
+
+                opts_fallback = opts.copy()
+                opts_fallback.update({
+                    # Formatos progressivos têm vídeo e áudio juntos. No
+                    # YouTube, normalmente a melhor alternativa é 360p.
+                    "format": (
+                        "best[ext=mp4][vcodec!=none][acodec!=none]/"
+                        "best[vcodec!=none][acodec!=none]"
+                    ),
+                    "merge_output_format": "mp4",
+                    "overwrites": True,
+                    "retries": 3,
+                })
+
+                self._baixar_youtube_dl(opts_fallback, url, formato)
 
             self.window.after(0, lambda: self.status_label.configure(text="Download concluído!"))
             self.window.after(0, lambda: messagebox.showinfo("Sucesso", "Download finalizado com sucesso."))
@@ -717,6 +1154,7 @@ class Downloader:
             )
 
         finally:
+            liberar_download(lock_path)
             self.window.after(
                 0,
                 lambda: self.download_btn.configure(state="normal")
@@ -757,6 +1195,24 @@ class Downloader:
             return True
         messagebox.showwarning("FFmpeg", "FFmpeg não encontrado. Coloque o ffmpeg.exe na pasta do programa ou instale-o no sistema.")
         return False
+
+    def get_ffmpeg_binary(self):
+        """Retorna o caminho do ffmpeg: local (Windows/EXE) ou do sistema (PATH)."""
+        if sys.platform == "win32":
+            local = os.path.join(BASE_PATH, "ffmpeg.exe")
+            if os.path.exists(local):
+                return local
+        found = shutil.which("ffmpeg")
+        return found or "ffmpeg"
+
+    def get_ffprobe_binary(self):
+        """Retorna o caminho do ffprobe: local (Windows/EXE) ou do sistema (PATH)."""
+        if sys.platform == "win32":
+            local = os.path.join(BASE_PATH, "ffprobe.exe")
+            if os.path.exists(local):
+                return local
+        found = shutil.which("ffprobe")
+        return found or "ffprobe"
 
     def clear_url(self):
         self.url_entry.delete(0, "end")
@@ -997,7 +1453,13 @@ class Downloader:
     FORMATOS
 
     MP4
-    Baixa vídeo + áudio.
+    Baixa vídeo + áudio em H.264 + AAC,
+    o padrão mais compatível com
+    celulares, TVs, players e navegadores.
+    Se o YouTube só oferecer o vídeo em
+    VP9/AV1 ou o áudio em Opus (comum em
+    1440p/4K), o programa converte
+    automaticamente para H.264 + AAC.
 
     MP3
     Extrai somente o áudio.
