@@ -1084,7 +1084,7 @@ class Downloader:
                     "max_sleep_interval": 4,
                     # Se o YouTube recusar temporariamente um item, segue
                     # com os próximos da playlist em vez de abortar tudo.
-                    "ignoreerrors":  False,
+                    "ignoreerrors":  True,
                 })
             else:
                 opts.update({
