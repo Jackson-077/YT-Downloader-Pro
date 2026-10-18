@@ -14,6 +14,7 @@ import shutil
 import os
 import sys
 import threading
+import time
 import subprocess
 import requests
 import re
@@ -103,6 +104,8 @@ def preparar_ambiente():
     extras = [BASE_PATH]
     if getattr(sys, "_MEIPASS", None):
         extras.append(sys._MEIPASS)
+    # Pasta do usuário (não exige administrador): ~/.yt-downloader/bin
+    extras.append(os.path.join(os.path.expanduser("~"), ".yt-downloader", "bin"))
     if sys.platform != "win32":
         extras += ["/usr/local/bin", os.path.expanduser("~/.deno/bin")]
     atual = os.environ.get("PATH", "")
@@ -198,8 +201,40 @@ def erro_pede_login(msg):
         "sign in", "confirm you", "not a bot", "cookies",
         "login required", "private video", "age-restricted",
         "confirm your age", "age verification", "inappropriate for some users",
+        "log in", "registered users", "authentication", "members only",
+        "requires login", "use --cookies",
     )
     return any(t in msg for t in termos)
+
+
+def diagnostico():
+    """Resumo do ambiente (versão do yt-dlp, Deno, curl_cffi, FFmpeg). Ajuda a
+    entender por que o mesmo vídeo baixa em um computador e não em outro."""
+    try:
+        from yt_dlp.version import __version__ as ver
+    except Exception:
+        ver = "?"
+    sim = lambda b: "sim" if b else "NÃO"
+    linha = (
+        f"yt-dlp {ver} | Deno: {sim(shutil.which('deno'))} | "
+        f"curl_cffi: {sim(curl_cffi_disponivel())} | FFmpeg: {sim(shutil.which('ffmpeg'))}"
+    )
+    if not shutil.which("deno"):
+        linha += (
+            "\nDeno não encontrado: o YouTube pode bloquear sem ele. "
+            "Coloque o deno.exe ao lado do programa ou na pasta "
+            "~/.yt-downloader/bin (no Windows: %USERPROFILE%\\.yt-downloader\\bin)."
+        )
+    return linha
+
+
+def erro_sem_formato(erro):
+    """True se o yt-dlp não achou nenhum formato de mídia utilizável."""
+    msg = str(erro).lower()
+    return (
+        "requested format is not available" in msg
+        or "no video formats found" in msg
+    )
 
 
 def mensagem_amigavel(erro):
@@ -212,6 +247,10 @@ def mensagem_amigavel(erro):
         (("json object must be",),
          "O site mudou o formato dos dados e o extrator do yt-dlp falhou. "
          "Atualize o app/yt-dlp para a versão mais recente."),
+        (("requested format is not available",),
+         "O YouTube não devolveu os formatos de vídeo desta vez (falha "
+         "temporária, não tem relação com o vídeo). Clique em BAIXAR de novo; "
+         "se persistir, atualize o yt-dlp."),
         (("unsupported url",),
          "Este link não é suportado. Confira se é o link direto do vídeo."),
         (("getaddrinfo", "name or service not known", "network is unreachable",
@@ -227,8 +266,13 @@ def mensagem_amigavel(erro):
         (("not available in your country", "geo"),
          "Este vídeo é bloqueado na sua região."),
         (("sign in", "not a bot", "confirm you"),
-         "O site pediu login/confirmação anti-robô. Entre na sua conta no navegador "
-         "(Chrome/Firefox/Edge) e tente de novo."),
+         "O YouTube pediu login/confirmação anti-robô e não foi possível usar "
+         "os cookies de nenhum navegador.\n\n"
+         "Entre na sua conta do YouTube pelo Firefox (ou Chrome), feche o "
+         "navegador e tente de novo. Se continuar, use um arquivo cookies.txt "
+         "(extensão 'Get cookies.txt LOCALLY').\n"
+         "Obs.: Chrome/Edge/Brave recentes no Windows costumam não funcionar "
+         "(criptografia dos cookies) e precisam estar fechados."),
         (("ffmpeg", "ffprobe"),
          "Problema com o FFmpeg. Verifique se ele está instalado / ao lado do programa."),
         (("no space left", "disk full"),
@@ -236,9 +280,28 @@ def mensagem_amigavel(erro):
         (("permission denied",),
          "Sem permissão para gravar na pasta escolhida. Escolha outra pasta."),
     ]
+    # Outros sites (não YouTube) que exigem login: aviso claro e genérico.
+    if ("youtube" not in baixo and "youtu.be" not in baixo
+            and "private video" not in baixo and erro_pede_login(baixo)):
+        extra = ""
+        if ULTIMOS_ERROS_COOKIES:
+            extra = "\n\nTentativas de cookies:\n" + "\n".join(ULTIMOS_ERROS_COOKIES[:4])
+        return (
+            "Este vídeo exige login no site. Entre na sua conta pelo navegador "
+            "(de preferência Firefox, fechado antes) e tente de novo, "
+            "ou use um arquivo cookies.txt."
+            f"{extra}\n\nDetalhes técnicos:\n{texto[:300]}"
+        )
+
     for termos, dica in dicas:
         if any(t in baixo for t in termos):
-            return f"{dica}\n\nDetalhes técnicos:\n{texto[:500]}"
+            extra = ""
+            if ULTIMOS_ERROS_COOKIES and "sign in" in baixo:
+                extra = "\n\nTentativas de cookies:\n" + "\n".join(ULTIMOS_ERROS_COOKIES[:4])
+            if any(t in baixo for t in ("sign in", "not a bot", "confirm you",
+                                        "requested format is not available")):
+                extra += f"\n\nDiagnóstico: {diagnostico()}"
+            return f"{dica}{extra}\n\nDetalhes técnicos:\n{texto[:300]}"
     return texto[:800]
 
 LOCK_DIR = os.path.join(os.path.expanduser("~"), ".yt-downloader", "locks")
@@ -320,26 +383,52 @@ def get_video_only_url(url):
     return url
 
 
-def add_browser_cookies(opts):
-    """Procura, em silêncio, um navegador com cookies de sessão utilizáveis.
+# cookies.txt guardado pelo usuário (só é pedido quando nada mais funciona).
+COOKIES_CFG = {"file": ""}
 
-    Testa cada navegador suportado tentando de fato extrair cookies (não
-    apenas instanciar o YoutubeDL). Nenhuma mensagem de erro é exibida ao
-    usuário e nada é impresso no console caso nenhum navegador seja
-    encontrado — isso é esperado (nem todo mundo tem esses navegadores
-    instalados) e não deve parecer uma falha do programa.
+# Motivos pelos quais os navegadores falharam na última varredura. Mostrados
+# junto do erro final para ajudar a entender o que fazer.
+ULTIMOS_ERROS_COOKIES = []
+
+
+def _ordem_navegadores():
+    """Firefox primeiro no Windows: Chrome/Edge/Brave recentes protegem os
+    cookies com criptografia atrelada ao app (app-bound), que o yt-dlp não
+    consegue ler. Firefox não tem essa limitação."""
+    if sys.platform == "win32":
+        return ["firefox", "chrome", "edge", "brave", "vivaldi", "opera"]
+    return ["firefox", "chrome", "brave", "edge", "vivaldi", "opera"]
+
+
+def _motivo_cookie_amigavel(browser, erro):
+    """Traduz o erro técnico do yt-dlp para algo que o usuário entenda."""
+    nome = browser.capitalize()
+    msg = re.sub(r"\s+", " ", str(erro)).strip()
+    baixo = msg.lower()
+    if "could not find" in baixo:
+        return f"{nome}: não encontrado neste computador"
+    if "could not copy" in baixo or "database is locked" in baixo or "permission" in baixo:
+        return f"{nome}: cookies bloqueados (feche o {nome} por completo, inclusive em segundo plano)"
+    if "decrypt" in baixo or "dpapi" in baixo or "app-bound" in baixo or "app bound" in baixo:
+        return f"{nome}: criptografia do navegador impede a leitura dos cookies"
+    return f"{nome}: {msg[:90]}"
+
+
+def iter_opts_cookies(opts):
+    """Gera, um de cada vez e só quando pedido, cópias de opts usando os
+    cookies de cada navegador cujo perfil seja legível e, por último, o
+    cookies.txt guardado (se existir).
+
+    É um gerador de propósito: quem usa tenta o download com o primeiro
+    resultado e só pede o próximo se aquele navegador não tinha login
+    válido. Assim, um Firefox legível mas deslogado não impede o uso do
+    Chrome, e a varredura (lenta) pára no primeiro que funcionar.
+    Nada é impresso e nenhum erro é mostrado; os motivos das falhas ficam
+    em ULTIMOS_ERROS_COOKIES.
     """
+    ULTIMOS_ERROS_COOKIES.clear()
 
-    browsers = [
-        "chrome",
-        "edge",
-        "brave",
-        "vivaldi",
-        "opera",
-        "firefox",
-    ]
-
-    for browser in browsers:
+    for browser in _ordem_navegadores():
         try:
             teste = opts.copy()
             teste["cookiesfrombrowser"] = (browser,)
@@ -347,20 +436,48 @@ def add_browser_cookies(opts):
             teste["no_warnings"] = True
 
             with YoutubeDL(teste) as ydl:
-                # Força a extração real dos cookies (e não só a criação do
+                # Força a leitura real dos cookies (e não só a criação do
                 # objeto), que é onde erros de perfil/DB bloqueado aparecem.
                 ydl.cookiejar
-
-            opts["cookiesfrombrowser"] = (browser,)
-            return True
-
-        except Exception:
-            # Silencioso de propósito: navegador ausente, perfil bloqueado
-            # ou sem cookies são todos motivos legítimos de não usar esse
-            # navegador — não é um erro para mostrar ao usuário.
+        except Exception as e:
+            ULTIMOS_ERROS_COOKIES.append(_motivo_cookie_amigavel(browser, e))
             continue
 
-    return False
+        o = opts.copy()
+        o["cookiesfrombrowser"] = (browser,)
+        yield o
+
+    arquivo = COOKIES_CFG.get("file") or ""
+    if arquivo and os.path.isfile(arquivo):
+        o = opts.copy()
+        o.pop("cookiesfrombrowser", None)
+        o["cookiefile"] = arquivo
+        yield o
+
+
+# Clientes do YouTube que costumam funcionar SEM login e SEM PO Token. São
+# tentados antes de qualquer cookie quando o YouTube bloqueia o acesso padrão.
+CLIENTES_SEM_LOGIN = (
+    ["android_vr"],
+    ["tv_simply"],
+    ["web_embedded"],
+)
+
+
+def eh_youtube(url):
+    u = str(url).lower()
+    return "youtube.com" in u or "youtu.be" in u
+
+
+def com_clientes(opts, clientes):
+    """Cópia de opts forçando outros player_client do YouTube (mantém o
+    restante de extractor_args, como o provedor de PO Token)."""
+    o = opts.copy()
+    ea = {k: dict(v) for k, v in (o.get("extractor_args") or {}).items()}
+    yt = ea.setdefault("youtube", {})
+    yt["player_client"] = list(clientes)
+    o["extractor_args"] = ea
+    return o
 
 
 def extrair_info_com_fallback(ydl_opts, url, **extract_kwargs):
@@ -389,30 +506,41 @@ def extrair_info_com_fallback(ydl_opts, url, **extract_kwargs):
         if not precisa_login:
             raise
 
-        cookies_ok = add_browser_cookies(opts)
+        # 1º) Outros clientes do YouTube, sem cookies (não exige que o
+        # usuário esteja logado em nenhum navegador).
+        if eh_youtube(url):
+            for clientes in CLIENTES_SEM_LOGIN:
+                try:
+                    with YoutubeDL(com_clientes(opts, clientes)) as ydl:
+                        return ydl.extract_info(url, **extract_kwargs)
+                except Exception:
+                    continue
 
-        if cookies_ok:
-            try:
-                with YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(url, **extract_kwargs)
-            except Exception:
-                pass  # tenta a próxima estratégia abaixo
-
-        # Cookies não resolveram (ou não havia navegador com cookies
-        # válidos). Alguns vídeos são bloqueados especificamente no
-        # cliente "mweb"/"tv"/"web_safari" que fixamos em get_common_opts;
-        # como último recurso, deixamos o yt-dlp escolher livremente entre
-        # TODOS os clientes que ele suporta (o comportamento padrão dele
-        # às vezes contorna esse bloqueio quando um cliente fixo não
-        # consegue).
+        # 2º) Deixa o yt-dlp escolher livremente entre TODOS os clientes
+        # (em vez dos fixados em get_common_opts), ainda sem cookies.
+        livre = opts.copy()
+        livre.pop("extractor_args", None)
         if "extractor_args" in opts:
-            opts_sem_restricao = opts.copy()
-            opts_sem_restricao.pop("extractor_args", None)
             try:
-                with YoutubeDL(opts_sem_restricao) as ydl:
+                with YoutubeDL(livre) as ydl:
                     return ydl.extract_info(url, **extract_kwargs)
             except Exception:
                 pass
+
+        # 3º) Só agora varre os navegadores (e o cookies.txt guardado) atrás
+        # de um login válido, tentando um por vez.
+        for o in iter_opts_cookies(opts):
+            variantes = [o]
+            if "extractor_args" in o:
+                sem = o.copy()
+                sem.pop("extractor_args", None)
+                variantes.append(sem)
+            for variante in variantes:
+                try:
+                    with YoutubeDL(variante) as ydl:
+                        return ydl.extract_info(url, **extract_kwargs)
+                except Exception:
+                    continue
 
         # Nada funcionou: relata o erro original (mais claro para o
         # usuário do que os erros das tentativas intermediárias).
@@ -902,7 +1030,7 @@ class Downloader:
         self.status_label.configure(text="Buscando informações...")
         threading.Thread(target=self.get_info, args=(url,), daemon=True).start()
 
-    def get_info(self, url):
+    def get_info(self, url, _retry=False):
         try:
             ydl_opts_fast = self.get_common_opts()
             ydl_opts_fast.update({
@@ -1012,6 +1140,17 @@ class Downloader:
         except Exception as e:
             # Captura a mensagem agora: a variável "e" deixa de existir ao
             # sair do except e a lambda roda depois, na thread principal.
+            if not _retry and erro_pede_login(e):
+                # Navegadores já foram varridos sem sucesso: pede o login.
+                if self.perguntar_cookies_txt(e):
+                    self.ui_after(0, lambda: self.status_label.configure(
+                        text="Tentando novamente com o login..."))
+                    self.get_info(url, _retry=True)
+                else:
+                    self.ui_after(0, lambda: self.status_label.configure(
+                        text="Login necessário para este vídeo."))
+                return
+
             erro = mensagem_amigavel(e)
             self.ui_after(
                 0,
@@ -1222,37 +1361,73 @@ class Downloader:
                     )
                 ydl.download([url])
 
-        opts_sem_cookie = opts.copy()
-        opts_sem_cookie.pop("cookiesfrombrowser", None)
+        base = opts.copy()
+        base.pop("cookiesfrombrowser", None)
+
+        def _sem_restricao(o):
+            # Deixa o yt-dlp escolher livremente entre TODOS os clientes do
+            # YouTube, em vez de fixar mweb/tv/web_safari.
+            o = o.copy()
+            o.pop("extractor_args", None)
+            return o
 
         try:
-            _run(opts_sem_cookie)
+            _run(base)
             return
         except Exception as primeiro_erro:
             if self.cancel_event.is_set():
                 raise
-            precisa_login = erro_pede_login(primeiro_erro)
-            if not precisa_login:
+
+            sem_formato = erro_sem_formato(primeiro_erro)
+            if not (sem_formato or erro_pede_login(primeiro_erro)):
                 raise
 
-            opts_cookie = opts.copy()
-            if not add_browser_cookies(opts_cookie):
-                raise primeiro_erro
+            def alternativas():
+                """Ordem: sem cookies (outros clientes) -> varre navegadores
+                -> cookies.txt guardado. Cada item é (aviso, opts); opts None
+                só atualiza o aviso (antes de uma etapa demorada)."""
+                msg_outro = "O site bloqueou o acesso. Tentando outro método..."
+                clientes = []
+                if eh_youtube(url):
+                    clientes = [(msg_outro, com_clientes(base, c))
+                                for c in CLIENTES_SEM_LOGIN]
 
-            try:
-                _run(opts_cookie)
-                return
-            except Exception:
-                # Última tentativa: deixa o yt-dlp escolher livremente
-                # entre todos os clientes, sem restringir a mweb/tv.
-                if "extractor_args" in opts_cookie:
-                    opts_livre = opts_cookie.copy()
-                    opts_livre.pop("extractor_args", None)
-                    _run(opts_livre)
+                if sem_formato:
+                    # Falha costuma ser transitória: repete (com clientes livres).
+                    yield "YouTube não liberou os formatos. Tentando de novo...", _sem_restricao(base)
+                    yield from clientes
+                else:
+                    yield from clientes
+                    if "extractor_args" in base:
+                        yield msg_outro, _sem_restricao(base)
+
+                yield "Procurando login salvo nos navegadores...", None
+                for o in iter_opts_cookies(base):
+                    yield "Tentando com o login do navegador...", o
+                    if "extractor_args" in o:
+                        yield "Tentando com o login do navegador...", _sem_restricao(o)
+
+            for aviso, alt in alternativas():
+                if self.cancel_event.is_set():
+                    raise primeiro_erro
+                self.ui_after(
+                    0, lambda t=aviso: self.status_label.configure(text=t)
+                )
+                if alt is None:
+                    continue
+                if sem_formato:
+                    time.sleep(1.5)
+                try:
+                    _run(alt)
                     return
-                raise
+                except Exception:
+                    if self.cancel_event.is_set():
+                        raise
+                    continue
 
-    def run_download(self):
+            raise primeiro_erro
+
+    def run_download(self, _retry=False):
         lock_path = None
         try:
             formato = self.format_var.get()
@@ -1402,6 +1577,15 @@ class Downloader:
                 self._remover_arquivo_incompleto()
                 self.ui_after(0, lambda: self.status_label.configure(text="Download cancelado."))
                 self.ui_after(0, lambda: self.progress_bar.set(0))
+            elif not _retry and erro_pede_login(e):
+                # Navegadores já foram varridos sem sucesso: pede o login.
+                if self.perguntar_cookies_txt(e):
+                    self.ui_after(0, lambda: self.status_label.configure(
+                        text="Tentando novamente com o login..."))
+                    self.run_download(_retry=True)
+                else:
+                    self.ui_after(0, lambda: self.status_label.configure(
+                        text="Login necessário para este vídeo."))
             else:
                 erro = mensagem_amigavel(e).encode("utf-8", "replace").decode("utf-8")
 
@@ -1550,17 +1734,66 @@ class Downloader:
         elif sys.platform == "darwin": subprocess.Popen(["open", self.download_folder])
         else: subprocess.Popen(["xdg-open", self.download_folder])
 
+    # -----------------------------------------
+    # Login (cookies.txt) — só é pedido quando nada automático funcionou
+    # -----------------------------------------
+    def choose_cookies_file(self):
+        """Pede um cookies.txt, guarda uma cópia na pasta do app (o original
+        nunca é alterado pelo yt-dlp) e lembra dele nas próximas vezes."""
+        caminho = filedialog.askopenfilename(
+            title="Selecione o arquivo cookies.txt",
+            filetypes=[("cookies.txt", "*.txt"), ("Todos", "*.*")],
+        )
+        if not caminho:
+            return False
+        try:
+            destino = os.path.join(os.path.dirname(self.config_file), "cookies.txt")
+            shutil.copyfile(caminho, destino)
+            COOKIES_CFG["file"] = destino
+            self.save_config()
+            return True
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não foi possível usar este arquivo:\n\n{e}")
+            return False
+
+    def perguntar_cookies_txt(self, erro):
+        """Chamado de uma thread de trabalho quando o site exige login e
+        nenhum navegador serviu. Explica o que fazer e oferece escolher um
+        cookies.txt. Retorna True se o usuário forneceu um (aí tentamos de
+        novo)."""
+        resultado = {"retry": False}
+        pronto = threading.Event()
+
+        def perguntar():
+            try:
+                texto = (
+                    mensagem_amigavel(erro)
+                    + "\n\nDeseja selecionar um arquivo cookies.txt agora e tentar novamente?"
+                )
+                if messagebox.askyesno("Login necessário", texto):
+                    resultado["retry"] = self.choose_cookies_file()
+            finally:
+                pronto.set()
+
+        self.ui_after(0, perguntar)
+        pronto.wait()
+        return resultado["retry"]
+
     def load_config(self):
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     config = json.load(f)
                     self.download_folder = config.get("download_folder", self.download_folder)
+                    COOKIES_CFG["file"] = config.get("cookies_file", "")
             except: pass
 
     def save_config(self):
         with open(self.config_file, "w", encoding="utf-8") as f:
-            json.dump({"download_folder": self.download_folder}, f, indent=4)
+            json.dump({
+                "download_folder": self.download_folder,
+                "cookies_file": COOKIES_CFG.get("file", ""),
+            }, f, indent=4)
 
     def save_history(self, titulo):
         registro = {
