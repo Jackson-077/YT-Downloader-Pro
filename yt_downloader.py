@@ -25,7 +25,24 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 from io import BytesIO
-from yt_dlp import YoutubeDL
+import zipfile
+
+# Pasta onde o botão "Atualizar componentes" coloca versões novas do yt-dlp
+# quando o app está empacotado (.exe/.deb, onde não existe pip).
+UPDATES_DIR = os.path.join(os.path.expanduser("~"), ".yt-downloader", "updates")
+if getattr(sys, "frozen", False) and os.path.isdir(os.path.join(UPDATES_DIR, "yt_dlp")):
+    sys.path.insert(0, UPDATES_DIR)
+
+try:
+    from yt_dlp import YoutubeDL
+except Exception:
+    # Atualização corrompida: descarta e volta para a versão do instalador.
+    if UPDATES_DIR in sys.path:
+        sys.path.remove(UPDATES_DIR)
+    for _m in [m for m in sys.modules if m.split(".")[0] in ("yt_dlp", "yt_dlp_ejs")]:
+        del sys.modules[_m]
+    shutil.rmtree(UPDATES_DIR, ignore_errors=True)
+    from yt_dlp import YoutubeDL
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from yt_dlp.postprocessor.common import PostProcessor
 from urllib.parse import urlparse, parse_qs
@@ -49,15 +66,32 @@ SUBPROCESS_FLAGS = (
 # -----------------------------
 # UTF-8 Windows
 # -----------------------------
+AVISOS_YTDLP = []  # últimos avisos do yt-dlp (ajudam a achar a causa real)
+# Quantos itens SEGUIDOS o YouTube recusou com "Sign in to confirm you're not a
+# bot". Numa playlist, usado para parar cedo (em vez de falhar 100 vezes).
+FALHAS_LOGIN = {"seguidas": 0}
+
+
 class UTF8Logger:
 
     def debug(self, msg):
         self.safe_print(msg)
 
     def warning(self, msg):
+        try:
+            AVISOS_YTDLP.append(str(msg)[:200])
+            del AVISOS_YTDLP[:-12]
+        except Exception:
+            pass
         self.safe_print(msg)
 
     def error(self, msg):
+        try:
+            baixo = str(msg).lower()
+            if "not a bot" in baixo or "sign in to confirm" in baixo:
+                FALHAS_LOGIN["seguidas"] += 1
+        except Exception:
+            pass
         self.safe_print(msg)
 
     def safe_print(self, msg):
@@ -163,6 +197,29 @@ class DownloadCancelado(_YDLDownloadCancelled):
     pass
 
 
+class PlaylistBloqueada(_YDLDownloadCancelled):
+    """Levantada para parar a playlist quando o YouTube recusa itens seguidos."""
+
+    def __init__(self, texto=""):
+        super().__init__(texto)
+        self.texto = texto
+
+    def __str__(self):
+        # O DownloadCancelled do yt-dlp devolve sempre a mensagem genérica
+        # "The download was cancelled"; precisamos do texto real para o app
+        # reconhecer o pedido de login (erro_pede_login) e tentar cookies.
+        return self.texto or "Playlist interrompida."
+
+
+def eh_mix_youtube(url):
+    """True para Mix/Rádio automático do YouTube (list=RD...): lista infinita."""
+    try:
+        lista = parse_qs(urlparse(str(url)).query).get("list", [""])[0]
+        return lista.startswith("RD")
+    except Exception:
+        return False
+
+
 def rodar_cancelavel(cmd, cancel_event=None, **kwargs):
     """Igual a subprocess.run(check=True, capture_output=True), mas encerra
     o processo (ex.: ffmpeg) assim que o usuário cancelar."""
@@ -184,6 +241,100 @@ def rodar_cancelavel(cmd, cancel_event=None, **kwargs):
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(proc.returncode, cmd, saida, erro)
     return subprocess.CompletedProcess(cmd, proc.returncode, saida, erro)
+
+
+def titulo_seguro(titulo, max_bytes=140):
+    """Título pronto para usar LITERALMENTE no outtmpl, cortado em BYTES.
+
+    O Linux limita cada nome de arquivo a 255 bytes (não caracteres).
+    Títulos em chinês/japonês/emoji usam 3-4 bytes por caractere, então
+    "%(title).100s" (100 caracteres) pode passar de 255 bytes e dar
+    "[Errno 36] File name too long".
+    """
+    from yt_dlp.utils import sanitize_filename
+    t = sanitize_filename(str(titulo or "").strip(), restricted=False)
+    b = t.encode("utf-8")[:max_bytes]
+    t = b.decode("utf-8", "ignore").strip(" .")
+    return t.replace("%", "%%") or "video"
+
+
+def _versao_ytdlp():
+    try:
+        from yt_dlp.version import __version__
+        return __version__
+    except Exception:
+        return "?"
+
+
+def atualizar_via_pip(aviso):
+    """Execução normal (python/venv): pip install -U dos componentes."""
+    antes = _versao_ytdlp()
+    aviso("Atualizando via pip (pode levar um minuto)...")
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-U",
+         "yt-dlp", "yt-dlp-ejs", "curl_cffi"],
+        capture_output=True, text=True, timeout=900,
+        creationflags=SUBPROCESS_FLAGS,
+    )
+    if r.returncode != 0:
+        saida = (r.stderr or r.stdout or "").strip()[-500:]
+        dica = ""
+        if "permission" in saida.lower() or "denied" in saida.lower():
+            dica = ("\n\nSem permissão para gravar no ambiente. Se o app está "
+                    "em /opt/yt-downloader, rode no terminal:\n"
+                    "sudo /opt/yt-downloader/venv/bin/pip install -U "
+                    "yt-dlp yt-dlp-ejs curl_cffi")
+        raise RuntimeError(f"O pip falhou:\n{saida}{dica}")
+    novo = subprocess.run(
+        [sys.executable, "-c",
+         "import yt_dlp.version as v; print(v.__version__)"],
+        capture_output=True, text=True, timeout=60,
+        creationflags=SUBPROCESS_FLAGS,
+    ).stdout.strip() or "?"
+    return f"yt-dlp: {antes} -> {novo}"
+
+
+def atualizar_via_wheels(aviso):
+    """App empacotado (sem pip): baixa o yt-dlp e o yt-dlp-ejs do PyPI
+    (wheels puros em Python, conferidos por SHA-256) para UPDATES_DIR."""
+    antes = _versao_ytdlp()
+    novo_dir = UPDATES_DIR + ".new"
+    shutil.rmtree(novo_dir, ignore_errors=True)
+    os.makedirs(novo_dir, exist_ok=True)
+    versoes = {}
+    try:
+        for pacote in ("yt-dlp", "yt-dlp-ejs"):
+            aviso(f"Baixando {pacote}...")
+            meta = requests.get(f"https://pypi.org/pypi/{pacote}/json", timeout=30)
+            meta.raise_for_status()
+            dados = meta.json()
+            arq = next(
+                (u for u in dados["urls"]
+                 if u.get("packagetype") == "bdist_wheel"
+                 and u["filename"].endswith("py3-none-any.whl")), None)
+            if not arq:
+                raise RuntimeError(f"Wheel universal de {pacote} não encontrado.")
+            bin_ = requests.get(arq["url"], timeout=120)
+            bin_.raise_for_status()
+            if hashlib.sha256(bin_.content).hexdigest() != arq["digests"]["sha256"]:
+                raise RuntimeError(f"SHA-256 de {pacote} não confere.")
+            with zipfile.ZipFile(io.BytesIO(bin_.content)) as z:
+                z.extractall(novo_dir)
+            versoes[pacote] = dados["info"]["version"]
+        if not os.path.isdir(os.path.join(novo_dir, "yt_dlp")):
+            raise RuntimeError("Pacote do yt-dlp veio incompleto.")
+        shutil.rmtree(UPDATES_DIR, ignore_errors=True)
+        if os.path.exists(UPDATES_DIR):
+            # Arquivo em uso (Windows): põe a pasta velha de lado.
+            os.replace(UPDATES_DIR, f"{UPDATES_DIR}.old{int(time.time())}")
+        os.replace(novo_dir, UPDATES_DIR)
+        for velho in [d for d in os.listdir(os.path.dirname(UPDATES_DIR))
+                      if d.startswith("updates.old")]:
+            shutil.rmtree(os.path.join(os.path.dirname(UPDATES_DIR), velho),
+                          ignore_errors=True)
+    finally:
+        shutil.rmtree(novo_dir, ignore_errors=True)
+    return f"yt-dlp: {antes} -> {versoes.get('yt-dlp', '?')}"
 
 
 def curl_cffi_disponivel():
@@ -244,18 +395,29 @@ def mensagem_amigavel(erro):
     baixo = texto.lower()
 
     dicas = [
+        (("file name too long", "errno 36", "unable to open for writing"),
+         "O nome do arquivo ficou longo demais para o sistema (títulos "
+         "com chinês/emoji ocupam mais bytes). Isso foi corrigido nesta "
+         "versão; se aparecer de novo, escolha uma pasta com caminho mais curto."),
         (("json object must be",),
          "O site mudou o formato dos dados e o extrator do yt-dlp falhou. "
          "Atualize o app/yt-dlp para a versão mais recente."),
         (("requested format is not available",),
-         "O YouTube não devolveu os formatos de vídeo desta vez (falha "
-         "temporária, não tem relação com o vídeo). Clique em BAIXAR de novo; "
-         "se persistir, atualize o yt-dlp."),
+         "O YouTube não liberou nenhum formato baixável para ESTE vídeo, "
+         "mesmo após tentar vários métodos. Costuma ser algo do próprio "
+         "vídeo (exclusivo Premium/membros, DRM, restrição de região ou "
+         "idade, live/estreia) ou yt-dlp desatualizado. Se outros vídeos "
+         "baixam normalmente, o problema é este vídeo. Atualize o yt-dlp "
+         "e, se persistir, tente com cookies.txt."),
         (("unsupported url",),
          "Este link não é suportado. Confira se é o link direto do vídeo."),
         (("getaddrinfo", "name or service not known", "network is unreachable",
           "temporary failure in name resolution", "timed out", "connection refused"),
          "Sem conexão com a internet ou o site está fora do ar."),
+        (("http error 451", "unavailable for legal reasons"),
+         "O site recusou este link por motivo legal (erro 451). Em geral o "
+         "vídeo foi removido ou está bloqueado na sua região. Isso vem do "
+         "site, não do app. Abra o link no navegador para confirmar."),
         (("http error 403", "403: forbidden"),
          "O site recusou o acesso (403). Tente novamente em instantes ou atualize o yt-dlp."),
         (("http error 404", "video unavailable", "this video is not available",
@@ -301,6 +463,8 @@ def mensagem_amigavel(erro):
             if any(t in baixo for t in ("sign in", "not a bot", "confirm you",
                                         "requested format is not available")):
                 extra += f"\n\nDiagnóstico: {diagnostico()}"
+                if AVISOS_YTDLP:
+                    extra += "\n\nAvisos do yt-dlp:\n" + "\n".join(AVISOS_YTDLP[-5:])
             return f"{dica}{extra}\n\nDetalhes técnicos:\n{texto[:300]}"
     return texto[:800]
 
@@ -879,6 +1043,12 @@ class Downloader:
         self.help_btn = ctk.CTkButton(frame_botoes, text="Ajuda", width=150, command=self.show_help)
         self.help_btn.grid(row=0, column=2, padx=10)
 
+        self.update_btn = ctk.CTkButton(
+            frame_botoes, text="Atualizar componentes", width=200,
+            fg_color="#6b4f1d", hover_color="#85631f",
+            command=self.atualizar_componentes)
+        self.update_btn.grid(row=1, column=0, columnspan=3, pady=(10, 0))
+
         # Exibição de Informações
         self.thumb_label = ctk.CTkLabel(self.main_frame, text="")
         self.thumb_label.pack(pady=10)
@@ -938,7 +1108,7 @@ class Downloader:
         opts = {
 
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
             "socket_timeout": 60,
             "nocolor": True,
             "retries": 10,
@@ -1289,7 +1459,7 @@ class Downloader:
             nonlocal dialog
             dialog = ctk.CTkToplevel(self.window)
             dialog.title("Playlist detectada")
-            dialog.geometry("450x420")
+            dialog.geometry("450x520")
             dialog.resizable(False, False)
             dialog.transient(self.window)
             dialog.grab_set()
@@ -1304,6 +1474,15 @@ class Downloader:
             ctk.CTkLabel(dialog, text=" Playlist detectada", font=("Arial", 22, "bold")).pack(pady=(20, 10))
             ctk.CTkLabel(dialog, text=f"Título: {title}", wraplength=400, font=("Arial", 14)).pack(pady=5)
             ctk.CTkLabel(dialog, text=f"Vídeos: {count} (Máximo 100 processados)", text_color="orange").pack(pady=5)
+            if eh_mix_youtube(self.playlist_url):
+                ctk.CTkLabel(
+                    dialog,
+                    text=("⚠ Este é um Mix automático do YouTube (lista "
+                          "infinita). Baixar o Mix inteiro é lento e o "
+                          "YouTube costuma pedir login. Para só o vídeo do "
+                          "link, use \"Baixar apenas este vídeo\"."),
+                    wraplength=400, text_color="#e0a030",
+                ).pack(pady=5)
 
             ctk.CTkButton(dialog, text="Baixar Playlist Completa (MP4)", width=320, height=45, fg_color="#1f538d", font=("Arial", 14, "bold"), command=lambda: set_result("playlist_mp4")).pack(pady=10)
             ctk.CTkButton(dialog, text="Baixar Playlist Completa (MP3)", width=320, height=45, fg_color="#2c6e49", font=("Arial", 14, "bold"), command=lambda: set_result("playlist_mp3")).pack(pady=5)
@@ -1341,13 +1520,28 @@ class Downloader:
         self.cancel_btn.configure(state="disabled")
         self.status_label.configure(text="Cancelando...")
 
-    def _baixar_youtube_dl(self, opts, url, formato):
+    _CHAVES_ACESSO = ("extractor_args", "cookiesfrombrowser", "cookiefile")
+
+    def _delta_acesso(self, o):
+        return {k: o.get(k) for k in self._CHAVES_ACESSO}
+
+    def _aplicar_acesso(self, o, delta):
+        o = o.copy()
+        for k in self._CHAVES_ACESSO:
+            if delta.get(k) is None:
+                o.pop(k, None)
+            else:
+                o[k] = delta[k]
+        return o
+
+    def _baixar_youtube_dl(self, opts, url, formato, preferido=None):
         """Baixa com yt-dlp tentando primeiro SEM cookies (mais rápido e
         não mexe nos navegadores). Só busca cookies de sessão se o próprio
         site pedir login/confirmação de que não é um robô — e, mesmo
         assim, em silêncio, sem mostrar isso como erro."""
 
         def _run(o):
+            FALHAS_LOGIN["seguidas"] = 0
             with YoutubeDL(o) as ydl:
                 if formato == "mp4":
                     ydl.add_post_processor(
@@ -1371,9 +1565,19 @@ class Downloader:
             o.pop("extractor_args", None)
             return o
 
+        # Em playlist, repete primeiro o método (cookies/cliente) que já
+        # funcionou no item anterior, em vez de refazer toda a escada.
+        if preferido is not None:
+            try:
+                _run(self._aplicar_acesso(base, preferido))
+                return preferido
+            except Exception:
+                if self.cancel_event.is_set():
+                    raise
+
         try:
             _run(base)
-            return
+            return self._delta_acesso(base)
         except Exception as primeiro_erro:
             if self.cancel_event.is_set():
                 raise
@@ -1419,13 +1623,92 @@ class Downloader:
                     time.sleep(1.5)
                 try:
                     _run(alt)
-                    return
+                    return self._delta_acesso(alt)
                 except Exception:
                     if self.cancel_event.is_set():
                         raise
                     continue
 
             raise primeiro_erro
+
+    def _baixar_playlist(self, opts, url, formato, sufixo):
+        """Baixa a playlist item a item, cada um pelo MESMO caminho do vídeo
+        individual (com cookies/outros clientes quando o YouTube recusa).
+
+        Antes o yt-dlp percorria a lista sozinho com ignoreerrors: se o
+        YouTube recusasse os itens (anti-robô), todos falhavam em silêncio e
+        o app nunca usava as alternativas."""
+        self.ui_after(0, lambda: self.status_label.configure(
+            text="Lendo a lista de vídeos..."))
+        info_opts = self.get_common_opts()
+        info_opts.update({
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "noplaylist": False,
+            "playlistend": 100,
+        })
+        info = extrair_info_com_fallback(info_opts, url, download=False)
+        entradas = [e for e in ((info or {}).get("entries") or []) if e]
+        if not entradas:
+            # Não é uma lista: baixa como vídeo único.
+            self._baixar_youtube_dl(opts, url, formato)
+            return
+
+        pasta = titulo_seguro(info.get("title") or "Playlist", 60)
+        total = len(entradas)
+        ok, falhas, seguidas, preferido = 0, [], 0, None
+
+        for i, e in enumerate(entradas, 1):
+            if self.cancel_event.is_set():
+                raise DownloadCancelado("Download cancelado pelo usuário.")
+            vid = e.get("id")
+            item_url = (f"https://www.youtube.com/watch?v={vid}"
+                        if vid and eh_youtube(url)
+                        else (e.get("url") or e.get("webpage_url")))
+            if not item_url:
+                continue
+
+            self._prefixo_item = f"[{i}/{total}] "
+            self.ui_after(0, lambda t=f"Item {i} de {total}...":
+                          self.status_label.configure(text=t))
+            o = opts.copy()
+            o.pop("ignoreerrors", None)
+            o.pop("playlistend", None)
+            o.update({
+                "noplaylist": True,
+                "outtmpl": os.path.join(
+                    self.download_folder, pasta,
+                    f"{i:03d} - %(title).45s{sufixo}.%(ext)s"),
+            })
+            try:
+                preferido = self._baixar_youtube_dl(o, item_url, formato, preferido)
+                ok += 1
+                seguidas = 0
+            except Exception as err:
+                if self.cancel_event.is_set():
+                    raise
+                msg = str(err).lower()
+                if any(t in msg for t in (
+                        "no space left", "permission denied",
+                        "unable to open for writing", "file name too long")):
+                    raise
+                falhas.append(vid or item_url)
+                seguidas += 1
+                if seguidas >= 3:
+                    break  # o YouTube recusou 3 seguidos mesmo com as alternativas
+
+        self._prefixo_item = ""
+        if ok == 0:
+            raise RuntimeError(
+                "Nenhum item da playlist foi baixado. O YouTube recusou os "
+                "vídeos (verificação anti-robô) mesmo com cookies e outros "
+                "métodos. Entre na sua conta pelo Firefox, feche-o e tente "
+                "de novo, ou use um cookies.txt.")
+        if falhas or ok < total:
+            self._resumo_playlist = (
+                f"{ok} de {total} vídeos baixados."
+                + (f"\nNão baixaram: {', '.join(falhas[:10])}" if falhas else "")
+                + ("\nParei após 3 falhas seguidas." if seguidas >= 3 else ""))
 
     def run_download(self, _retry=False):
         lock_path = None
@@ -1450,6 +1733,10 @@ class Downloader:
 
             opts = self.get_common_opts()
             self._arquivo_em_andamento = None
+            self._itens_ok = 0
+            self._prefixo_item = ""
+            self._resumo_playlist = ""
+            FALHAS_LOGIN["seguidas"] = 0
             opts.update({
                 "progress_hooks": [self.update_progress_hook],
                 # Garantem o cancelamento também entre itens da playlist
@@ -1483,13 +1770,14 @@ class Downloader:
                         f"bestvideo[vcodec^=avc1][height<={res}]+bestaudio[acodec^=mp4a]/"
                         f"bestvideo[height<={res}]+bestaudio/"
                         f"best[height<={res}]/"
-                        f"best"
+                        f"best/"
+                        f"bestvideo*/bestaudio"
                     )
                 else:
                     opts["format"] = (
                         "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
                         "bestvideo*+bestaudio/"
-                        "best"
+                        "best/bestvideo*/bestaudio"
                     )
 
                 opts["merge_output_format"] = "mp4"
@@ -1498,8 +1786,8 @@ class Downloader:
             if self.tipo_download == "playlist":
                 opts.update({
                     "outtmpl": os.path.join(
-                        self.download_folder, "%(playlist_title)s",
-                        f"%(playlist_index)s - %(title)s{sufixo_duplicata}.%(ext)s",
+                        self.download_folder, "%(playlist_title).45s",
+                        f"%(playlist_index)s - %(title).45s{sufixo_duplicata}.%(ext)s",
                     ),
                     "noplaylist": False,
                     "playlistend": 100,
@@ -1517,14 +1805,17 @@ class Downloader:
                 opts.update({
                     "outtmpl": os.path.join(
                         self.download_folder,
-                        f"%(title).100s [%(id)s]{sufixo_duplicata}.%(ext)s",
+                        f"{titulo_seguro((getattr(self, 'info', None) or {}).get('title'))} [%(id)s]{sufixo_duplicata}.%(ext)s",
                     ),
                     "noplaylist": True,
                 })
 
             
             try:
-                self._baixar_youtube_dl(opts, url, formato)
+                if self.tipo_download == "playlist":
+                    self._baixar_playlist(opts, url, formato, sufixo_duplicata)
+                else:
+                    self._baixar_youtube_dl(opts, url, formato)
             except Exception as erro_download:
                 if self.cancel_event.is_set():
                     raise
@@ -1534,6 +1825,13 @@ class Downloader:
                 # vídeo no mesmo arquivo; assim nunca concluímos com vídeo
                 # mudo por causa da falha do fluxo de áudio.
                 is_youtube = "youtube.com" in url or "youtu.be" in url
+                msg_dl = str(erro_download).lower()
+                # Erros de disco/nome de arquivo não têm a ver com o formato:
+                # tentar outro formato só esconderia o erro verdadeiro.
+                if any(t in msg_dl for t in (
+                        "unable to open for writing", "file name too long",
+                        "no space left", "permission denied")):
+                    raise
                 if (self.tipo_download != "video" or formato != "mp4"
                         or not is_youtube):
                     raise erro_download
@@ -1551,14 +1849,22 @@ class Downloader:
                     # YouTube, normalmente a melhor alternativa é 360p.
                     "format": (
                         "best[ext=mp4][vcodec!=none][acodec!=none]/"
-                        "best[vcodec!=none][acodec!=none]"
+                        "best[vcodec!=none][acodec!=none]/"
+                        "best/bestvideo*/bestaudio"
                     ),
                     "merge_output_format": "mp4",
                     "overwrites": True,
                     "retries": 3,
                 })
 
-                self._baixar_youtube_dl(opts_fallback, url, formato)
+                try:
+                    self._baixar_youtube_dl(opts_fallback, url, formato)
+                except Exception:
+                    if self.cancel_event.is_set():
+                        raise
+                    # Mostra o erro ORIGINAL (o do fallback costuma ser só
+                    # consequência e confunde o diagnóstico).
+                    raise erro_download
 
             # Rede de segurança: se o cancelamento foi engolido em algum
             # ponto, não mostra "concluído".
@@ -1567,7 +1873,8 @@ class Downloader:
 
             self.ui_after(0, lambda: self.cancel_btn.configure(state="disabled"))
             self.ui_after(0, lambda: self.status_label.configure(text="Download concluído!"))
-            self.ui_after(0, lambda: messagebox.showinfo("Sucesso", "Download finalizado com sucesso."))
+            self.ui_after(0, lambda: messagebox.showinfo(
+                "Sucesso", self._resumo_playlist or "Download finalizado com sucesso."))
             
             if self.tipo_download == "video":
                 self.save_history(self.info.get("title", "Vídeo"))
@@ -1641,6 +1948,9 @@ class Downloader:
             self._arquivo_em_andamento = d.get("filename") or d.get("tmpfilename")
         elif d.get("status") == "finished":
             self._arquivo_em_andamento = None
+            self._itens_ok = getattr(self, "_itens_ok", 0) + 1
+        if d.get("status") in ("downloading", "finished"):
+            FALHAS_LOGIN["seguidas"] = 0
         if d["status"] == "downloading":
             try:
                 downloaded = d.get("downloaded_bytes", 0)
@@ -1661,7 +1971,7 @@ class Downloader:
                     speed = re.sub(r"\x1b\[[0-9;]*m", "", speed)
                 
                 eta = re.sub(r"\x1b\[[0-9;]*m", "", str(d.get("_eta_str", "") or "")).strip()
-                texto = f"Baixando... {speed}" + (f"  •  restam {eta}" if eta and eta != "N/A" else "")
+                texto = f"{getattr(self, '_prefixo_item', '')}Baixando... {speed}" + (f"  •  restam {eta}" if eta and eta != "N/A" else "")
                 self.ui_after(0, lambda t=texto: self.status_label.configure(text=t))
             except: pass
         elif d["status"] == "finished":
@@ -1809,6 +2119,36 @@ class Downloader:
         historico.append(registro)
         with open(self.history_file, "w", encoding="utf-8") as f:
             json.dump(historico, f, indent=4, ensure_ascii=False)
+
+    def atualizar_componentes(self):
+        if not messagebox.askyesno(
+                "Atualizar componentes",
+                "Vai baixar a versão mais recente do yt-dlp e do solver de "
+                "JavaScript do YouTube (yt-dlp-ejs).\n\n"
+                "É preciso internet e reabrir o programa depois. Continuar?"):
+            return
+        self.update_btn.configure(state="disabled")
+        threading.Thread(target=self._run_atualizacao, daemon=True).start()
+
+    def _run_atualizacao(self):
+        def aviso(t):
+            self.ui_after(0, lambda: self.status_label.configure(text=t))
+        try:
+            if getattr(sys, "frozen", False):
+                res = atualizar_via_wheels(aviso)
+            else:
+                res = atualizar_via_pip(aviso)
+            aviso("Componentes atualizados. Reabra o programa.")
+            self.ui_after(0, lambda: messagebox.showinfo(
+                "Atualização concluída",
+                f"{res}\n\nFeche e abra o programa para usar a versão nova."))
+        except Exception as e:
+            aviso("Falha ao atualizar.")
+            msg = str(e)[:700]
+            self.ui_after(0, lambda: messagebox.showerror(
+                "Erro na atualização", msg))
+        finally:
+            self.ui_after(0, lambda: self.update_btn.configure(state="normal"))
 
     def show_help(self):
         help_win = ctk.CTkToplevel(self.window)
