@@ -13,7 +13,7 @@ hiddenimports = ['PIL._tkinter_finder', 'yt_dlp.cookies', 'browser_cookie3']
 # precisam entrar COMPLETOS no executável, senão alguns sites/recursos falham.
 for pacote in ('customtkinter', 'PIL', 'yt_dlp', 'curl_cffi', 'certifi',
                'keyring', 'secretstorage', 'bgutil_ytdlp_pot_provider',
-               'yt_dlp_plugins', 'browser_cookie3', 'Cryptodome', 'lz4'):
+               'yt_dlp_plugins', 'yt_dlp_ejs', 'browser_cookie3', 'Cryptodome', 'lz4'):
     try:
         d, b, h = collect_all(pacote)
         datas += d; binaries += b; hiddenimports += h
