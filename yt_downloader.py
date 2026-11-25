@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ==========================================================
 # YT Downloader Pro
-# Versão: 1.8 (Universal Edition - Linux/Windows)
+# Versão: 1.0.12 (Universal Edition - Linux/Windows)
 #
 # Autor: Jackson Q.
 # Downloader gráfico utilizando yt-dlp
@@ -26,6 +26,19 @@ from tkinter import filedialog, messagebox
 from PIL import Image
 from io import BytesIO
 import zipfile
+import tempfile
+import webbrowser
+
+# -----------------------------------------------------------
+# Atualização do programa via GitHub Releases
+# IMPORTANTE: APP_VERSION deve ser igual à tag da release (ex.: tag 1.0.9
+# -> APP_VERSION = "1.0.9"). Os scripts de build (.deb / .iss) leem daqui.
+# -----------------------------------------------------------
+APP_VERSION = "1.0.11"
+GITHUB_REPO = "Jackson-077/YT-Downloader-Pro"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_LATEST_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 
 # Pasta onde o botão "Atualizar componentes" coloca versões novas do yt-dlp
 # quando o app está empacotado (.exe/.deb, onde não existe pip).
@@ -932,6 +945,113 @@ class EnsureH264AACPP(PostProcessor):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# -----------------------------
+# Atualização do programa (GitHub Releases)
+# -----------------------------
+def parse_versao(txt):
+    """'v1.0.9' / '1.0.9' -> (1, 0, 9). Permite comparar versões."""
+    nums = re.findall(r"\d+", str(txt))
+    return tuple(int(n) for n in nums) or (0,)
+
+
+def _ext_do_sistema():
+    return ".exe" if sys.platform == "win32" else ".deb"
+
+
+def _headers_github():
+    return {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"YT-Downloader-Pro/{APP_VERSION}",
+    }
+
+
+def buscar_ultima_release(timeout=15):
+    """Consulta a última release publicada no GitHub.
+
+    Retorna dict: tag, nome, url, sha256 (ou None), notas, pagina.
+    Tenta a API (traz o SHA-256 do arquivo); se a API estiver limitada
+    (403, comum em redes compartilhadas), usa o redirect de /releases/latest.
+    """
+    ext = _ext_do_sistema()
+    try:
+        r = requests.get(GITHUB_API_LATEST, headers=_headers_github(), timeout=timeout)
+        if r.status_code == 200:
+            d = r.json()
+            tag = d["tag_name"]
+            asset = next((a for a in d.get("assets", [])
+                          if a["name"].lower().endswith(ext)), None)
+            if asset is None:
+                raise RuntimeError(f"A release {tag} não tem arquivo {ext}.")
+            digest = asset.get("digest") or ""
+            sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
+            return {
+                "tag": tag,
+                "nome": asset["name"],
+                "url": asset["browser_download_url"],
+                "sha256": sha,
+                "notas": (d.get("body") or "").strip(),
+                "pagina": d.get("html_url") or GITHUB_RELEASES_PAGE,
+            }
+    except requests.RequestException:
+        pass
+
+    # Fallback sem API: /releases/latest redireciona para /releases/tag/<tag>
+    r = requests.get(GITHUB_LATEST_PAGE, headers=_headers_github(),
+                     timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    tag = r.url.rstrip("/").rsplit("/", 1)[-1]
+    if not re.search(r"\d", tag):
+        raise RuntimeError("Não consegui descobrir a última versão no GitHub.")
+    nome = f"YT-Downloader-Pro{ext}"
+    return {
+        "tag": tag,
+        "nome": nome,
+        "url": f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{nome}",
+        "sha256": None,
+        "notas": "",
+        "pagina": r.url,
+    }
+
+
+def baixar_arquivo(url, destino, sha256_esperado=None, progresso=None):
+    """Baixa url para destino (via .part) e confere o SHA-256 se informado."""
+    if not url.startswith("https://github.com/"):
+        raise RuntimeError("URL de atualização inesperada; abortando por segurança.")
+    h = hashlib.sha256()
+    tmp = destino + ".part"
+    with requests.get(url, stream=True, timeout=30, headers=_headers_github()) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        feito = 0
+        with open(tmp, "wb") as f:
+            for bloco in r.iter_content(chunk_size=256 * 1024):
+                if not bloco:
+                    continue
+                f.write(bloco)
+                h.update(bloco)
+                feito += len(bloco)
+                if progresso and total:
+                    progresso(feito, total)
+    if sha256_esperado and h.hexdigest().lower() != sha256_esperado.lower():
+        os.remove(tmp)
+        raise RuntimeError("O arquivo baixado está corrompido (SHA-256 não confere).")
+    os.replace(tmp, destino)
+
+
+def env_limpo_para_filho():
+    """Ambiente para rodar apt/pkexec ou reabrir o app a partir do binário
+    PyInstaller sem herdar as bibliotecas/variáveis internas dele."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 class Downloader:
     def __init__(self):
         self.window = ctk.CTk()
@@ -965,6 +1085,10 @@ class Downloader:
         
         # Verifica binários na inicialização
         self.check_local_binaries()
+
+        # Verifica atualização do programa em segundo plano (só instalado)
+        if getattr(sys, "frozen", False):
+            self.window.after(4000, lambda: self.verificar_atualizacao_app(silencioso=True))
         
         self.window.mainloop()
 
@@ -1048,6 +1172,12 @@ class Downloader:
             fg_color="#6b4f1d", hover_color="#85631f",
             command=self.atualizar_componentes)
         self.update_btn.grid(row=1, column=0, columnspan=3, pady=(10, 0))
+
+        self.app_update_btn = ctk.CTkButton(
+            frame_botoes, text=f"Verificar atualização do programa (v{APP_VERSION})",
+            width=330, fg_color="#1d4f6b", hover_color="#1f6385",
+            command=self.verificar_atualizacao_app)
+        self.app_update_btn.grid(row=2, column=0, columnspan=3, pady=(10, 0))
 
         # Exibição de Informações
         self.thumb_label = ctk.CTkLabel(self.main_frame, text="")
@@ -2149,6 +2279,203 @@ class Downloader:
                 "Erro na atualização", msg))
         finally:
             self.ui_after(0, lambda: self.update_btn.configure(state="normal"))
+
+    # -----------------------------------------
+    # Atualização do programa (GitHub Releases)
+    # -----------------------------------------
+    def verificar_atualizacao_app(self, silencioso=False):
+        if getattr(self, "_verificando_app", False):
+            return
+        self._verificando_app = True
+        if not silencioso:
+            self.app_update_btn.configure(state="disabled", text="Verificando...")
+        threading.Thread(target=self._thread_verificar_app,
+                         args=(silencioso,), daemon=True).start()
+
+    def _restaurar_botao_app(self):
+        self._verificando_app = False
+        self.app_update_btn.configure(
+            state="normal",
+            text=getattr(self, "_texto_botao_app",
+                         f"Verificar atualização do programa (v{APP_VERSION})"))
+
+    def _thread_verificar_app(self, silencioso):
+        try:
+            rel = buscar_ultima_release()
+        except Exception as e:
+            msg = str(e)[:400]
+            if not silencioso:
+                self.ui_after(0, lambda: messagebox.showerror(
+                    "Atualização",
+                    "Não foi possível verificar atualizações.\n"
+                    f"Confira sua internet e tente de novo.\n\n{msg}"))
+            self.ui_after(0, self._restaurar_botao_app)
+            return
+
+        if parse_versao(rel["tag"]) <= parse_versao(APP_VERSION):
+            if not silencioso:
+                self.ui_after(0, lambda: messagebox.showinfo(
+                    "Atualização",
+                    f"Você já está na versão mais recente (v{APP_VERSION})."))
+            self.ui_after(0, self._restaurar_botao_app)
+            return
+
+        if silencioso:
+            def avisar():
+                self._texto_botao_app = f"Atualizar para v{rel['tag']} (nova versão!)"
+                self.status_label.configure(
+                    text=f"Nova versão disponível: v{rel['tag']}")
+                self._restaurar_botao_app()
+            self.ui_after(0, avisar)
+        else:
+            self.ui_after(0, lambda: self._oferecer_atualizacao(rel))
+
+    def _oferecer_atualizacao(self, rel):
+        self._restaurar_botao_app()
+        notas = rel["notas"][:600]
+        texto = (f"Nova versão disponível: v{rel['tag']}\n"
+                 f"Você está na v{APP_VERSION}.\n\n")
+        if notas:
+            texto += f"{notas}\n\n"
+        if not getattr(sys, "frozen", False):
+            if messagebox.askyesno("Atualização",
+                                   texto + "Abrir a página de downloads no navegador?"):
+                webbrowser.open(rel["pagina"])
+            return
+        if str(self.download_btn.cget("state")) == "disabled":
+            messagebox.showwarning(
+                "Atualização",
+                texto + "Há um download em andamento. Espere terminar e tente de novo.")
+            return
+        if not messagebox.askyesno("Atualização",
+                                   texto + "Baixar e instalar agora? O programa vai reiniciar."):
+            return
+        self.app_update_btn.configure(state="disabled")
+        self._verificando_app = True
+        threading.Thread(target=self._thread_instalar_app, args=(rel,), daemon=True).start()
+
+    def _thread_instalar_app(self, rel):
+        def status(t):
+            self.ui_after(0, lambda: self.status_label.configure(text=t))
+        try:
+            pasta = os.path.join(tempfile.gettempdir(), "yt-downloader-update")
+            os.makedirs(pasta, exist_ok=True)
+            destino = os.path.join(pasta, rel["nome"])
+            ultimo = [-1]
+
+            def prog(feito, total):
+                pct = int(feito * 100 / total)
+                if pct != ultimo[0]:
+                    ultimo[0] = pct
+                    self.ui_after(0, lambda: (
+                        self.progress_bar.set(pct / 100),
+                        self.status_label.configure(
+                            text=f"Baixando v{rel['tag']}... {pct}%")))
+
+            status(f"Baixando v{rel['tag']}...")
+            baixar_arquivo(rel["url"], destino, rel.get("sha256"), prog)
+            status("Instalando atualização...")
+            self._instalar_pacote(destino, rel["tag"])
+        except Exception as e:
+            msg = str(e)[:700]
+            status("Falha ao atualizar.")
+            self.ui_after(0, lambda: messagebox.showerror("Erro na atualização", msg))
+            self.ui_after(0, self._restaurar_botao_app)
+
+    def _instalar_pacote(self, arquivo, tag):
+        if sys.platform == "win32":
+            import ctypes
+            # "runas" pede a permissão de administrador (UAC) para o instalador.
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", arquivo,
+                "/SILENT /CLOSEAPPLICATIONS", None, 1)
+            if ret <= 32:
+                raise RuntimeError("A instalação foi cancelada ou negada pelo Windows.")
+            self.ui_after(500, self._sair_para_atualizar)
+            return
+
+        # Linux (.deb)
+        env = env_limpo_para_filho()
+        pk = shutil.which("pkexec")
+        if not pk:
+            subprocess.Popen(["xdg-open", arquivo], env=env, start_new_session=True)
+            raise RuntimeError(
+                "Não encontrei o pkexec. Abri o pacote no instalador do sistema; "
+                "instale por lá e reabra o programa.")
+        # Saída do apt vai para um arquivo (não por pipe) e sem perguntas
+        # interativas: assim nada fica esperando e dá para ver o que houve.
+        log = os.path.join(os.path.expanduser("~"), ".yt-downloader", "update.log")
+        self.ui_after(0, lambda: self.status_label.configure(
+            text="Instalando atualização... (informe a senha na janela do sistema)"))
+        inicio = time.time()
+        ultimo_aviso = 0
+        with open(log, "w", encoding="utf-8", errors="replace") as lf:
+            proc = subprocess.Popen(
+                [pk, "env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_MODE=a",
+                 "apt-get", "install", "-y", "--allow-downgrades", arquivo],
+                stdin=subprocess.DEVNULL, stdout=lf, stderr=subprocess.STDOUT, env=env)
+            while True:
+                try:
+                    rc = proc.wait(timeout=2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                dec = int(time.time() - inicio)
+                if dec > 900:
+                    proc.kill()
+                    raise RuntimeError(f"A instalação demorou demais. Veja o log: {log}")
+                est = self._estado_pacote(env)
+                if (dec > 5 and est and est[0] == "ii"
+                        and parse_versao(est[1]) == parse_versao(tag)):
+                    rc = 0  # pacote já instalado e configurado; o apt só está terminando
+                    break
+                if dec - ultimo_aviso >= 5:
+                    ultimo_aviso = dec
+                    self.ui_after(0, lambda d=dec: self.status_label.configure(
+                        text=f"Instalando atualização... {d}s"))
+        if rc in (126, 127):
+            raise RuntimeError("Autorização cancelada. Nada foi alterado.")
+        if rc != 0:
+            try:
+                with open(log, encoding="utf-8", errors="replace") as lf:
+                    fim = lf.read()[-600:]
+            except Exception:
+                fim = ""
+            if "lock" in fim.lower() or "trava" in fim.lower():
+                raise RuntimeError(
+                    "Já existe outra instalação do sistema (apt) em andamento. "
+                    "Aguarde alguns minutos e tente de novo; se continuar, "
+                    "reinicie o computador.")
+            raise RuntimeError(f"Falha na instalação (código {rc}).\n{fim}\nLog: {log}")
+
+        exe = shutil.which("yt-downloader") or "/usr/bin/yt-downloader"
+
+        def concluir():
+            messagebox.showinfo(
+                "Atualização concluída",
+                f"O programa foi atualizado para a v{tag}.\n\nEle vai reabrir agora.")
+            subprocess.Popen([exe], env=env, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._sair_para_atualizar()
+        self.ui_after(0, concluir)
+
+    def _estado_pacote(self, env):
+        """(estado, versão) do pacote no dpkg; estado 'ii' = instalado e configurado."""
+        try:
+            r = subprocess.run(
+                ["dpkg-query", "-W", "-f=${db:Status-Abbrev}|${Version}", "yt-downloader"],
+                capture_output=True, text=True, timeout=5, env=env)
+            ab, _, ver = r.stdout.partition("|")
+            return ab.strip(), ver.strip()
+        except Exception:
+            return None
+
+    def _sair_para_atualizar(self):
+        try:
+            self.window.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     def show_help(self):
         help_win = ctk.CTkToplevel(self.window)
