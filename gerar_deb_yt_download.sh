@@ -26,7 +26,13 @@ set -e
 
 NOME_PACOTE="yt-downloader"
 
-VERSAO="1.8.0"
+# Versão única: vem do APP_VERSION do yt_downloader.py (igual à tag da release)
+VERSAO=$(grep -oP '^APP_VERSION = "\K[^"]+' yt_downloader.py)
+
+if [ -z "$VERSAO" ]; then
+    echo "❌ APP_VERSION não encontrado em yt_downloader.py"
+    exit 1
+fi
 
 EXECUTAVEL="yt-downloader"
 
@@ -81,6 +87,7 @@ echo "🐍 Atualizando dependências Python..."
 
 venv/bin/pip install -U \
 yt-dlp \
+yt-dlp-ejs \
 curl_cffi \
 bgutil-ytdlp-pot-provider \
 customtkinter \
@@ -256,11 +263,18 @@ set -e
 # Instala Deno para yt-dlp (EJS)
 # =====================================
 
-if ! command -v deno >/dev/null 2>&1; then
+if ! command -v deno >/dev/null 2>&1 && [ ! -x /usr/local/bin/deno ] && [ ! -x /usr/bin/deno ]; then
 
     echo "Instalando Deno..."
 
-    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+    # CI=1 desliga a pergunta interativa "Edit shell configs...?" do instalador
+    # do Deno (era ela que travava o apt); com tempo máximo e sem derrubar o pacote
+    curl -fsSL --connect-timeout 15 --max-time 180 \
+        https://deno.land/install.sh -o /tmp/deno-install.sh \
+        && CI=1 DENO_INSTALL=/usr/local timeout 240 sh /tmp/deno-install.sh </dev/null \
+        || true
+
+    rm -f /tmp/deno-install.sh
 
 fi
 
